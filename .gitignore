@@ -1,0 +1,32 @@
+# Virtualenv / packaging
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.cursor/
+*.swp
+
+# Debug / local dumps
+*.log
+debug-*.log
+
+# App exports and inspection crops (regenerated locally)
+output/**
+!output/.gitkeep
+
+# User-uploaded test photos (not part of the app)
+assets/covers/user_*
