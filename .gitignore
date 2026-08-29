@@ -28,5 +28,10 @@ debug-*.log
 output/**
 !output/.gitkeep
 
-# User-uploaded test photos (not part of the app)
-assets/covers/user_*
+# Generated sample PNGs/JPGs (created on first run / smoke-test)
+assets/covers/*
+!assets/covers/.gitkeep
+assets/examples/*
+!assets/examples/.gitkeep
+assets/icons/*
+!assets/icons/.gitkeep

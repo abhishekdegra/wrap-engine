@@ -30,7 +30,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The sample files in `assets/covers/` and `assets/examples/` are only for testing. The app does not lock you to a built-in cover.
+The app does not ship built-in cover photos. Upload your own cover and design. Sample PNGs used by `--smoke-test` are generated locally on first run.
 
 ## Workflow
 
@@ -85,7 +85,7 @@ cover_software/
   app/core/image_transform.py    fit / crop / perspective
   app/core/compositor.py         no-haze compositing
   app/core/export_manager.py     PNG / JPG
-  assets/covers/sample_cover.png
+  assets/covers/                 empty (samples generated locally)
   output/
 ```
 
