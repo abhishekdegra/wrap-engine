@@ -44,16 +44,25 @@ def fit_design_to_canvas(
     return canvas
 
 
+from enum import Enum
+
+
+class FitMode(str, Enum):
+    COVER = "cover"
+    CONTAIN = "contain"
+    CENTER = "center"
+
+
 def fit_design_to_quad(
     design_rgba: np.ndarray,
     canvas_h: int,
     canvas_w: int,
     dst_quad: np.ndarray,
+    mode: str | FitMode = FitMode.COVER,
 ) -> np.ndarray:
-    """Object-fit cover the design, then homography-warp onto ``dst_quad``.
+    """Fit the design using mode ('cover', 'contain', 'center'), then homography-warp onto ``dst_quad``.
 
-    Aspect ratio is preserved. Excess is cropped before the warp. Rounded
-    clipping is applied later via the printable mask — not a rectangle crop.
+    Aspect ratio is preserved. Rounded clipping is applied later via the printable mask.
     """
     if design_rgba.ndim != 3 or design_rgba.shape[2] != 4:
         raise ValueError("Design must be an HxWx4 RGBA array")
@@ -66,7 +75,14 @@ def fit_design_to_quad(
     target_w = max(1, int(round(max(width_top, width_bot))))
     target_h = max(1, int(round(max(height_l, height_r))))
 
-    fitted = object_fit_cover(design_rgba, target_w, target_h)
+    mode_str = str(mode).lower().split(".")[-1]
+    if mode_str == "contain":
+        fitted = object_fit_contain(design_rgba, target_w, target_h)
+    elif mode_str == "center":
+        fitted = object_fit_center(design_rgba, target_w, target_h)
+    else:
+        fitted = object_fit_cover(design_rgba, target_w, target_h)
+
     src = np.array(
         [[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]],
         dtype=np.float32,
@@ -104,6 +120,39 @@ def object_fit_cover(image: np.ndarray, target_w: int, target_h: int) -> np.ndar
         padded[:h, :w] = cropped[:h, :w]
         return padded
     return cropped
+
+
+def object_fit_contain(image: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    """Uniform scale so the entire image is visible inside target, padded with transparency."""
+    src_h, src_w = image.shape[:2]
+    if src_w < 1 or src_h < 1:
+        return np.zeros((target_h, target_w, image.shape[2]), dtype=image.dtype)
+
+    scale = min(target_w / float(src_w), target_h / float(src_h))
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    resized = high_quality_resize(image, new_w, new_h)
+
+    out = np.zeros((target_h, target_w, image.shape[2]), dtype=image.dtype)
+    x0 = (target_w - new_w) // 2
+    y0 = (target_h - new_h) // 2
+    out[y0 : y0 + new_h, x0 : x0 + new_w] = resized
+    return out
+
+
+def object_fit_center(image: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    """Place design centered without scaling unless larger than target."""
+    src_h, src_w = image.shape[:2]
+    if src_w < 1 or src_h < 1:
+        return np.zeros((target_h, target_w, image.shape[2]), dtype=image.dtype)
+    if src_w > target_w or src_h > target_h:
+        return object_fit_contain(image, target_w, target_h)
+
+    out = np.zeros((target_h, target_w, image.shape[2]), dtype=image.dtype)
+    x0 = (target_w - src_w) // 2
+    y0 = (target_h - src_h) // 2
+    out[y0 : y0 + src_h, x0 : x0 + src_w] = image
+    return out
 
 
 def high_quality_resize(image: np.ndarray, new_w: int, new_h: int) -> np.ndarray:

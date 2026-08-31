@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -261,6 +262,17 @@ class MainWindow(QMainWindow):
         self.btn_design.clicked.connect(self._on_upload_design)
         layout.addWidget(self.btn_design)
 
+        fit_row = QHBoxLayout()
+        fit_row.setSpacing(6)
+        fit_lbl = QLabel("Fit mode:")
+        fit_lbl.setObjectName("muted")
+        self.combo_fit = QComboBox()
+        self.combo_fit.addItems(["Cover (Fill)", "Contain (Fit)", "Center"])
+        self.combo_fit.currentIndexChanged.connect(self._on_fit_mode_changed)
+        fit_row.addWidget(fit_lbl)
+        fit_row.addWidget(self.combo_fit, 1)
+        layout.addLayout(fit_row)
+
         layout.addWidget(self._camera_group())
         layout.addWidget(self._adjust_group())
 
@@ -491,6 +503,11 @@ class MainWindow(QMainWindow):
         self.brush_slider.blockSignals(False)
         self.final_preview.brush_radius = 14.0
 
+        if hasattr(self, "combo_fit"):
+            self.combo_fit.blockSignals(True)
+            self.combo_fit.setCurrentIndex(0)
+            self.combo_fit.blockSignals(False)
+
         self._reset_look()
         if hasattr(self, "_zoom_label"):
             self._zoom_label.setText("100%")
@@ -509,6 +526,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._start_cover_load(path)
+
+    def _on_fit_mode_changed(self, index: int) -> None:
+        modes = ["cover", "contain", "center"]
+        if 0 <= index < len(modes):
+            mode = modes[index]
+            res = self.processor.set_fit_mode(mode)
+            if res is not None:
+                self._result = res
+                self._refresh_previews(keep_mask=True)
 
     def _on_upload_design(self) -> None:
         if self._busy:

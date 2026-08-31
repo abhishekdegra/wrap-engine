@@ -37,8 +37,11 @@ JPG_QUALITY = 95
 # Optional frost over artwork. Default MUST stay 0 — any >0 washes colors out.
 COVER_OVERLAY_STRENGTH = 0.0
 
+# Surface lighting blend strength for realistic 'printed behind cover material' reflections/highlights.
+SURFACE_LIGHTING_STRENGTH = 0.08
+
 # Side-wall / thickness exclusion (measured from the photo when possible).
-SIDE_WALL_MAX_FRACTION = 0.055
+SIDE_WALL_MAX_FRACTION = 0.025
 
 # Tiny extra exclusion around the detected camera island.
 CAMERA_SAFETY_FRACTION = 0.005

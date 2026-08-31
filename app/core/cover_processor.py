@@ -15,7 +15,7 @@ from app.core.compositor import composite_design_under_cover
 from app.core.cover_adjust import CoverLook, apply_cover_look
 from app.core.cover_detector import CoverDetection, apply_manual_camera, apply_manual_camera_mask, detect_cover
 from app.core.export_manager import export_jpg, export_png
-from app.core.image_transform import fit_design_to_quad
+from app.core.image_transform import FitMode, fit_design_to_quad
 from app.core.mask_generator import MaskSet
 from app.utils.constants import PREVIEW_MAX_SIDE
 from app.utils.image_utils import CoverError, load_image_rgba, mask_to_preview
@@ -41,6 +41,7 @@ class CoverProcessor:
         self.masks: MaskSet | None = None
         self.last_result: ProcessingResult | None = None
         self.look = CoverLook()
+        self.fit_mode: str = "cover"
         self._fitted: np.ndarray | None = None
 
     def reset(self) -> None:
@@ -50,6 +51,7 @@ class CoverProcessor:
         self.masks = None
         self.last_result = None
         self.look = CoverLook()
+        self.fit_mode = "cover"
         self._fitted = None
 
     def load_cover(self, path: str | Path) -> CoverDetection:
@@ -87,6 +89,12 @@ class CoverProcessor:
     def set_look(self, look: CoverLook) -> None:
         self.look = look
 
+    def set_fit_mode(self, mode: str) -> ProcessingResult | None:
+        self.fit_mode = mode.lower()
+        if self.design is not None and self.cover is not None and self.detection is not None:
+            return self.process_design_array(self.design)
+        return None
+
     def process_design(self, design_path: str | Path) -> ProcessingResult:
         if self.cover is None or self.masks is None or self.detection is None:
             raise CoverError("Upload a phone cover first.")
@@ -109,7 +117,7 @@ class CoverProcessor:
         self.design = design_rgba
         canvas_h, canvas_w = self.cover.shape[:2]
         self._fitted = fit_design_to_quad(
-            design_rgba, canvas_h, canvas_w, self.detection.back_quad
+            design_rgba, canvas_h, canvas_w, self.detection.back_quad, mode=self.fit_mode
         )
         return self._build_result(preview=False)
 

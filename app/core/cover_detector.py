@@ -745,11 +745,10 @@ def _grabcut_from_prior(
     sure = cv2.erode(prior_s.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     if sure.any():
         mask[sure.astype(bool)] = cv2.GC_FGD
-    mx, my = max(2, int(0.04 * sw)), max(2, int(0.04 * sh))
-    mask[:my, :] = cv2.GC_BGD
-    mask[-my:, :] = cv2.GC_BGD
-    mask[:, :mx] = cv2.GC_BGD
-    mask[:, -mx:] = cv2.GC_BGD
+    mask[0, :] = cv2.GC_BGD
+    mask[-1, :] = cv2.GC_BGD
+    mask[:, 0] = cv2.GC_BGD
+    mask[:, -1] = cv2.GC_BGD
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
     bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
@@ -781,29 +780,40 @@ def _clean_cover_silhouette(mask: np.ndarray) -> np.ndarray:
     return _fill_holes(_largest_component(closed.astype(bool)))
 
 
+def _sample_background_lab(lab: np.ndarray) -> tuple[np.ndarray, float]:
+    h, w = lab.shape[:2]
+    cw = max(4, int(0.04 * w))
+    ch = max(4, int(0.04 * h))
+    corners = np.concatenate([
+        lab[:ch, :cw].reshape(-1, 3),
+        lab[:ch, -cw:].reshape(-1, 3),
+        lab[-ch:, :cw].reshape(-1, 3),
+        lab[-ch:, -cw:].reshape(-1, 3),
+        lab[0, :].reshape(-1, 3),
+        lab[-1, :].reshape(-1, 3),
+        lab[:, 0].reshape(-1, 3),
+        lab[:, -1].reshape(-1, 3),
+    ], axis=0)
+    med = np.median(corners, axis=0)
+    dist = np.linalg.norm(corners - med[None, :], axis=1)
+    thresh = float(np.percentile(dist, 90) + max(4.0, 0.45 * float(np.std(dist))))
+    return med, thresh
+
+
 def _lab_border_fg(rgb: np.ndarray) -> np.ndarray:
     """Pixels whose color is unlike the image-border background."""
     height, width = rgb.shape[:2]
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    band = max(6, int(0.055 * min(height, width)))
-    border = np.zeros((height, width), dtype=bool)
-    border[:band, :] = True
-    border[-band:, :] = True
-    border[:, :band] = True
-    border[:, -band:] = True
-    med = np.median(lab[border], axis=0)
+    med, thresh = _sample_background_lab(lab)
     dist = np.linalg.norm(lab - med[None, None, :], axis=2)
-    border_d = dist[border]
-    thresh = float(np.percentile(border_d, 92) + max(6.0, 0.55 * float(np.std(border_d))))
     fg = dist > thresh
-    # If almost everything is foreground, the phone matches the backdrop — abort.
-    if float(fg.mean()) > 0.88:
+    if float(fg.mean()) > 0.92 or float(fg.mean()) < 0.05:
         return np.zeros((height, width), dtype=bool)
     return fg
 
 
 def _grabcut_border_fg(rgb: np.ndarray) -> np.ndarray:
-    """GrabCut with a sure-background frame so the full phone is foreground."""
+    """GrabCut with clean corner background seeds and central foreground prior."""
     height, width = rgb.shape[:2]
     scale = min(1.0, 560.0 / float(max(height, width)))
     if scale < 0.99:
@@ -816,14 +826,12 @@ def _grabcut_border_fg(rgb: np.ndarray) -> np.ndarray:
         small = rgb
     sh, sw = small.shape[:2]
     mask = np.full((sh, sw), cv2.GC_PR_BGD, dtype=np.uint8)
-    mx = max(2, int(0.07 * sw))
-    my = max(2, int(0.07 * sh))
-    mask[:my, :] = cv2.GC_BGD
-    mask[-my:, :] = cv2.GC_BGD
-    mask[:, :mx] = cv2.GC_BGD
-    mask[:, -mx:] = cv2.GC_BGD
-    y0, y1 = int(0.10 * sh), int(0.90 * sh)
-    x0, x1 = int(0.16 * sw), int(0.84 * sw)
+    mask[0, :] = cv2.GC_BGD
+    mask[-1, :] = cv2.GC_BGD
+    mask[:, 0] = cv2.GC_BGD
+    mask[:, -1] = cv2.GC_BGD
+    y0, y1 = int(0.12 * sh), int(0.88 * sh)
+    x0, x1 = int(0.15 * sw), int(0.85 * sw)
     mask[y0:y1, x0:x1] = cv2.GC_PR_FGD
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
@@ -839,16 +847,20 @@ def _grabcut_border_fg(rgb: np.ndarray) -> np.ndarray:
 
 
 def _edge_outer_only(rgb: np.ndarray) -> np.ndarray:
-    """Largest external closed outline — ignore internal camera/logo edges."""
+    """Largest external closed outline using multi-scale edge magnitude."""
     height, width = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 30, 100)
-    k = max(5, int(round(min(height, width) * 0.012)))
+    edges1 = cv2.Canny(blur, 20, 70)
+    edges2 = cv2.Canny(blur, 35, 110)
+    grad = cv2.morphologyEx(blur, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    _, grad_bin = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    combined = np.maximum(np.maximum(edges1, edges2), grad_bin)
+    k = max(5, int(round(min(height, width) * 0.015)))
     if k % 2 == 0:
         k += 1
     closed = cv2.morphologyEx(
-        edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=1
+        combined, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=2
     )
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best = np.zeros((height, width), dtype=np.uint8)
@@ -877,6 +889,9 @@ def _inner_printable_panel(
     """Inner printable lip from this cover's geometry (nested contour, then measured inset)."""
     rgb = cover_rgba[..., :3]
     outer_area = max(float(np.count_nonzero(outer)), 1.0)
+    ys_out, _ = np.where(outer)
+    outer_top = int(ys_out.min()) if ys_out.size else 0
+    outer_bot = int(ys_out.max()) if ys_out.size else 0
 
     for candidate in (
         _inner_from_visible_lip(rgb, outer, min_side),
@@ -886,7 +901,14 @@ def _inner_printable_panel(
             continue
         panel = _fill_holes(candidate.astype(bool) & outer)
         frac = float(np.count_nonzero(panel)) / outer_area
-        if 0.84 <= frac <= 0.985 and _phone_score(panel, outer.shape[0], outer.shape[1]) >= 0.30:
+        if 0.86 <= frac <= 0.985 and _phone_score(panel, outer.shape[0], outer.shape[1]) >= 0.30:
+            ys_in, _ = np.where(panel)
+            if ys_in.size:
+                top_gap = ys_in.min() - outer_top
+                bot_gap = outer_bot - ys_in.max()
+                # If bottom gap is significantly larger than top gap, an internal charging port / speaker hole was picked
+                if bot_gap > max(8.0, top_gap * 2.2):
+                    continue
             return panel
 
     bumper = _side_wall_width(cover_rgba, outer, has_alpha, min_side)
@@ -894,8 +916,8 @@ def _inner_printable_panel(
     floor = _bumper_floor_px(min_side)
     bumper = float(np.clip(bumper, floor, ceiling))
     back, _px = _inset_keeping_large_panel(outer, bumper, min_side)
-    if float(np.count_nonzero(back)) < 0.84 * outer_area:
-        back, _px = _inset_keeping_large_panel(outer, max(floor, 0.004 * min_side), min_side)
+    if float(np.count_nonzero(back)) < 0.88 * outer_area:
+        back, _px = _inset_keeping_large_panel(outer, max(floor, 0.005 * min_side), min_side)
     return back & outer
 
 

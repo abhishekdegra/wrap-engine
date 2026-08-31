@@ -72,8 +72,8 @@ def masks_from_binaries(
     cap_outer = dilate_binary(outer_src, 2.4)
     if outer_pts is not None and inset_px > 0.35:
         back_pts = _offset_closed_polyline(outer_pts, -float(inset_px))
-        outer_m = _rasterize_wrap_polyline(outer_pts, outer_src.shape, feather, cap_bin=cap_outer, cap_slack=1.6)
-        back_m = _rasterize_wrap_polyline(back_pts, outer_src.shape, feather, cap_bin=cap_outer, cap_slack=1.6)
+        outer_m = _rasterize_wrap_polyline(outer_pts, outer_src.shape, feather, cap_bin=None)
+        back_m = _rasterize_wrap_polyline(back_pts, outer_src.shape, feather, cap_bin=None)
         back_m = np.minimum(back_m, outer_m)
     else:
         outer_m = silhouette_to_aa_mask(outer_src, feather)
@@ -277,19 +277,116 @@ def _clamp_polyline_inside(pts: np.ndarray, binary: np.ndarray, slack: float = 0
 
 
 def _finish_wrap_polyline(pts: np.ndarray | None) -> np.ndarray | None:
-    """Uniform sub-pixel smoothing of the detected closed contour (no fitted rectangle)."""
+    """Sub-pixel regularized phone contour — eliminates side button bumps and bottom shadow leaks."""
     if pts is None or pts.shape[0] < 16:
         return pts
+    reg = _fit_regularized_phone_contour(pts)
+    if reg is not None and reg.shape[0] >= 64:
+        return reg
+
     peri = float(np.linalg.norm(np.diff(np.vstack([pts, pts[0]]), axis=0), axis=1).sum())
     dense_n = int(np.clip(peri * 1.25, 256, 4096))
     work = _resample_closed_polyline(pts.astype(np.float64), dense_n)
-    work = _rolling_median_closed(work, 7)
-    work = _despike_side_bumps(work)
+    work = _rolling_median_closed(work, 5)
     work = _chaikin_closed(work, iterations=2)
     if work.shape[0] > 2048:
         work = _resample_closed_polyline(work, 2048)
-    work = _smooth_closed_polyline(work, sigma_frac=0.0062)
+    work = _smooth_closed_polyline(work, sigma_frac=0.0035)
     return work
+
+
+def _fit_regularized_phone_contour(pts: np.ndarray) -> np.ndarray | None:
+    """Fit a clean, smooth, oriented rounded rectangle to contour points, ignoring button bumps & shadow leaks."""
+    if pts.shape[0] < 32:
+        return None
+
+    pts_f = pts.astype(np.float32).reshape(-1, 1, 2)
+    (cx0, cy0), (rw, rh), angle = cv2.minAreaRect(pts_f)
+    if rw > rh:
+        rw, rh = rh, rw
+        angle = angle + 90.0
+
+    aspect = rh / float(max(rw, 1.0))
+    if aspect < 1.15 or aspect > 3.2:
+        return None
+
+    rad = np.deg2rad(angle)
+    cos_a, sin_a = float(np.cos(rad)), float(np.sin(rad))
+
+    pts_2d = pts.astype(np.float64)
+    dx = pts_2d[:, 0] - cx0
+    dy = pts_2d[:, 1] - cy0
+    u = dx * cos_a + dy * sin_a
+    v = -dx * sin_a + dy * cos_a
+
+    mid_h = 0.25 * rh
+    left_mask = (u < 0) & (np.abs(v) < mid_h)
+    right_mask = (u > 0) & (np.abs(v) < mid_h)
+
+    mid_w = 0.20 * rw
+    top_mask = (v < 0) & (np.abs(u) < mid_w)
+    bot_mask = (v > 0) & (np.abs(u) < mid_w)
+
+    if not (left_mask.any() and right_mask.any() and top_mask.any() and bot_mask.any()):
+        return None
+
+    u_left = float(np.percentile(u[left_mask], 75))
+    u_right = float(np.percentile(u[right_mask], 25))
+    v_top = float(np.percentile(v[top_mask], 75))
+    v_bot = float(np.percentile(v[bot_mask], 25))
+
+    w_fit = max(u_right - u_left, 10.0)
+    h_fit = max(v_bot - v_top, 10.0)
+
+    u_mid = (u_left + u_right) / 2.0
+    v_mid = (v_top + v_bot) / 2.0
+    cx_fit = cx0 + u_mid * cos_a - v_mid * sin_a
+    cy_fit = cy0 + u_mid * sin_a + v_mid * cos_a
+
+    r_est = 0.12 * w_fit
+    c_tl = (u < u_left + r_est * 1.3) & (v < v_top + r_est * 1.3)
+    if c_tl.any() and c_tl.sum() >= 5:
+        d_tl = np.sqrt((u[c_tl] - (u_left + r_est)) ** 2 + (v[c_tl] - (v_top + r_est)) ** 2)
+        r_measured = float(np.median(d_tl))
+        if 0.06 * w_fit <= r_measured <= 0.20 * w_fit:
+            r_est = r_measured
+
+    hw = w_fit / 2.0
+    hh = h_fit / 2.0
+    r = float(np.clip(r_est, 0.07 * w_fit, 0.18 * w_fit))
+
+    num_arc = 32
+    num_side = 64
+    segs: list[np.ndarray] = []
+
+    # Top edge: left to right
+    segs.append(np.stack([np.linspace(-hw + r, hw - r, num_side, endpoint=False), np.full(num_side, -hh)], axis=1))
+    # TR arc
+    t_tr = np.linspace(-np.pi / 2, 0, num_arc, endpoint=False)
+    segs.append(np.stack([(hw - r) + r * np.cos(t_tr), (-hh + r) + r * np.sin(t_tr)], axis=1))
+    # Right edge: top to bottom
+    segs.append(np.stack([np.full(num_side, hw), np.linspace(-hh + r, hh - r, num_side, endpoint=False)], axis=1))
+    # BR arc
+    t_br = np.linspace(0, np.pi / 2, num_arc, endpoint=False)
+    segs.append(np.stack([(hw - r) + r * np.cos(t_br), (hh - r) + r * np.sin(t_br)], axis=1))
+    # Bottom edge: right to left
+    segs.append(np.stack([np.linspace(hw - r, -hw + r, num_side, endpoint=False), np.full(num_side, hh)], axis=1))
+    # BL arc
+    t_bl = np.linspace(np.pi / 2, np.pi, num_arc, endpoint=False)
+    segs.append(np.stack([(-hw + r) + r * np.cos(t_bl), (hh - r) + r * np.sin(t_bl)], axis=1))
+    # Left edge: bottom to top
+    segs.append(np.stack([np.full(num_side, -hw), np.linspace(hh - r, -hh + r, num_side, endpoint=False)], axis=1))
+    # TL arc
+    t_tl = np.linspace(np.pi, 3 * np.pi / 2, num_arc, endpoint=False)
+    segs.append(np.stack([(-hw + r) + r * np.cos(t_tl), (-hh + r) + r * np.sin(t_tl)], axis=1))
+
+    local_poly = np.concatenate(segs, axis=0)
+    world_poly = np.stack([
+        cx_fit + local_poly[:, 0] * cos_a - local_poly[:, 1] * sin_a,
+        cy_fit + local_poly[:, 0] * sin_a + local_poly[:, 1] * cos_a,
+    ], axis=1)
+
+    return world_poly
 
 
 def _corner_proximity_mask(pts: np.ndarray, frac: float = 0.18) -> np.ndarray:
