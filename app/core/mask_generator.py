@@ -94,6 +94,27 @@ def masks_from_binaries(
     )
 
 
+def override_camera_exclusion(masks: MaskSet, camera_aa: np.ndarray) -> MaskSet:
+    """Replace camera cutout with a user-drawn antialiased mask (exact shape)."""
+    cam = np.clip(np.asarray(camera_aa, dtype=np.float32), 0.0, 1.0)
+    if cam.ndim == 3:
+        cam = cam[..., 0]
+    back = masks.printable_back.astype(np.float32)
+    outer = masks.outer if masks.outer is not None else np.ones_like(back)
+    if cam.shape != back.shape:
+        cam = cv2.resize(cam, (back.shape[1], back.shape[0]), interpolation=cv2.INTER_LINEAR)
+    cam = np.minimum(cam, outer.astype(np.float32))
+    final_print = np.clip(back * (1.0 - cam), 0.0, 1.0).astype(np.float32)
+    final_print[final_print < 0.02] = 0.0
+    return MaskSet(
+        printable_back=back,
+        camera_exclusion=cam.astype(np.float32),
+        edge_exclusion=masks.edge_exclusion.astype(np.float32),
+        final_print=final_print,
+        outer=outer.astype(np.float32) if outer is not None else None,
+    )
+
+
 def _camera_aa_mask(camera_bin: np.ndarray, feather: float) -> np.ndarray:
     """Hi-res AA for a compact island; SDF-only if the blob is a smear."""
     if camera_bin is None or not np.any(camera_bin):

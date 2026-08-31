@@ -17,6 +17,7 @@ from app.core.mask_generator import (
     inset_binary,
     inset_smooth,
     masks_from_binaries,
+    override_camera_exclusion,
     refine_outer_binary,
 )
 from app.utils.constants import (
@@ -187,6 +188,45 @@ def apply_manual_camera(
         [],
         raw_outer=detection.raw_outer if detection.raw_outer is not None else detection.outer_bin,
     )
+
+
+def apply_manual_camera_mask(
+    cover_rgba: np.ndarray,
+    detection: CoverDetection,
+    camera_aa: np.ndarray,
+) -> CoverDetection:
+    """Replace camera exclusion with a user-drawn antialiased mask (image pixels)."""
+    cam = np.clip(np.asarray(camera_aa, dtype=np.float32), 0.0, 1.0)
+    if cam.ndim == 3:
+        cam = cam[..., 0]
+    height, width = cover_rgba.shape[:2]
+    if cam.shape != (height, width):
+        cam = cv2.resize(cam, (width, height), interpolation=cv2.INTER_LINEAR)
+    outer = detection.outer_bin.astype(np.float32)
+    cam = cam * outer
+    camera_bin = cam > 0.12
+    print_body = detection.back_full
+    back_printable = print_body & ~(cam > 0.45)
+    if print_body.any() and float(np.count_nonzero(back_printable)) < 0.04 * float(np.count_nonzero(print_body)):
+        raise CoverError("That camera mask covers the whole back panel. Draw a smaller area.")
+    quad = back_panel_quad(detection.back_full)
+    packed = _pack_detection(
+        cover_rgba,
+        detection.outer_bin,
+        detection.back_full,
+        back_printable,
+        camera_bin,
+        quad,
+        bool(camera_bin.any()),
+        detection.has_alpha,
+        [],
+        raw_outer=detection.raw_outer if detection.raw_outer is not None else detection.outer_bin,
+    )
+    packed.masks = override_camera_exclusion(packed.masks, cam)
+    packed.camera_bin = camera_bin
+    packed.debug_images["camera_exclusion"] = mask_to_preview(packed.masks.camera_exclusion)
+    packed.debug_images["final_print_mask"] = mask_to_preview(packed.masks.final_print)
+    return packed
 
 
 def _pack_detection(

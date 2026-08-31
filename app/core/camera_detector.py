@@ -111,7 +111,8 @@ def _plausible_camera_island(mask: np.ndarray, back: np.ndarray) -> bool:
         return False
     if w > 0.45 * bw and aspect > 1.9:
         return False
-    if 0.42 < frac_x < 0.58:
+    # Center-of-back reject is for wide logos/rings, not a compact lens cluster.
+    if 0.42 < frac_x < 0.58 and (extent < 0.55 or w > 0.38 * bw):
         return False
     return True
 
@@ -126,34 +127,42 @@ def _island_extent(mask: np.ndarray) -> float:
 
 
 def _regularize_camera_island(mask: np.ndarray, back: np.ndarray) -> np.ndarray:
-    """Replace a jagged Canny island with the compact module fitted to those pixels."""
+    """Keep an axis-aligned compact module — never a rotated min-area rectangle."""
     if mask is None or not mask.any():
         return mask
     island = mask.astype(bool) & back.astype(bool)
     if not island.any():
         return mask
-    ys, xs = np.where(island)
-    pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
-    if pts.shape[0] < 12:
-        return island
-    (_cx, _cy), (rw, rh), ang = cv2.minAreaRect(pts)
-    rw = max(float(rw), 4.0) * 1.06
-    rh = max(float(rh), 4.0) * 1.06
-    box = cv2.boxPoints(((_cx, _cy), (rw, rh), ang)).astype(np.int32)
-    out = np.zeros(mask.shape, dtype=np.uint8)
-    cv2.fillConvexPoly(out, box, 1)
-    rad = max(3, int(round(0.22 * min(rw, rh))))
-    if rad % 2 == 0:
-        rad += 1
-    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rad, rad)))
-    fitted = fill_binary_holes(out.astype(bool)) & back
+    fitted = _axis_aligned_module(island, back)
     if not fitted.any():
         return island
-    # Keep the fit only if it still covers the detected optics/island core.
     overlap = float(np.count_nonzero(fitted & island)) / max(float(np.count_nonzero(island)), 1.0)
     if overlap < 0.82:
         return island
     return fitted
+
+
+def _axis_aligned_module(island: np.ndarray, back: np.ndarray) -> np.ndarray:
+    ys, xs = np.where(island)
+    if xs.size < 8:
+        return island
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    bw = max(1, x1 - x0 + 1)
+    bh = max(1, y1 - y0 + 1)
+    pad = max(2, int(round(0.06 * min(bw, bh))))
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(island.shape[1] - 1, x1 + pad)
+    y1 = min(island.shape[0] - 1, y1 + pad)
+    out = np.zeros(island.shape, dtype=np.uint8)
+    rect = (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    rad = max(3, int(round(0.18 * min(rect[2], rect[3]))))
+    cv2.rectangle(out, (x0, y0), (x1, y1), 1, thickness=cv2.FILLED)
+    k = rad if rad % 2 == 1 else rad + 1
+    k = max(3, k)
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    return fill_binary_holes(out.astype(bool)) & back
 
 
 def _smooth_island_contour(mask: np.ndarray) -> np.ndarray:
@@ -177,7 +186,7 @@ def _smooth_island_contour(mask: np.ndarray) -> np.ndarray:
     # Convex hull only if it stays a compact module, not a giant bite.
     hull = _filled_contour_around(closed)
     if hull.any():
-        if float(np.count_nonzero(hull)) <= 1.45 * max(float(np.count_nonzero(closed)), 1.0):
+        if float(np.count_nonzero(hull)) <= 1.12 * max(float(np.count_nonzero(closed)), 1.0):
             closed = hull
     return smooth_silhouette(closed, sigma=max(1.0, 0.012 * min_side))
 
@@ -255,8 +264,10 @@ def _rgb_camera_module(
     ranked: list[tuple[float, np.ndarray]] = []
 
     boxed = _rounded_box_around_lenses(lenses, top, back, min_side)
-    if n_lenses >= 1 and _plausible_camera_island(boxed, back):
+    if n_lenses >= 1 and boxed.any() and _plausible_camera_island(boxed, back):
         ranked.append((0.98 if n_lenses >= 2 else 0.72, boxed))
+    elif n_lenses >= 1 and boxed.any():
+        ranked.append((0.88 if n_lenses >= 2 else 0.70, boxed))
 
     if n_lenses >= 2:
         clustered = _island_from_lenses(lenses, top, back, back_area, min_side)
@@ -288,15 +299,30 @@ def _rgb_camera_module(
     if not ranked:
         fallback = _edge_contrast_module(rgb, gray, top, back, back_area, min_side, y0, bh, x0, bw)
         if _plausible_camera_island(fallback, back):
-            ranked.append((0.64, fallback))
+            if n_lenses >= 1 and lenses.any():
+                cover = float(np.count_nonzero(fallback & lenses)) / max(float(np.count_nonzero(lenses)), 1.0)
+                if cover < 0.20:
+                    fallback = np.zeros_like(fallback)
+            if fallback.any():
+                ranked.append((0.64, fallback))
 
     if not ranked:
         return np.zeros((height, width), dtype=bool), 0.0
 
+    def _lens_cover(m: np.ndarray) -> float:
+        if not lenses.any():
+            return 1.0
+        return float(np.count_nonzero(m & lenses)) / max(float(np.count_nonzero(lenses)), 1.0)
+
+    if lenses.any():
+        covering = [(score, m) for score, m in ranked if _lens_cover(m) >= 0.20]
+        if covering:
+            ranked = covering
+
     def _lens_bonus(m: np.ndarray) -> float:
         if not lenses.any():
             return 0.0
-        return 0.08 if np.any(m & lenses) else 0.0
+        return 0.12 if _lens_cover(m) >= 0.20 else -0.35
 
     ranked.sort(key=lambda item: item[0] + _lens_bonus(item[1]), reverse=True)
     return ranked[0][1], ranked[0][0]
@@ -581,24 +607,22 @@ def _rounded_box_around_lenses(
     back: np.ndarray,
     min_side: float,
 ) -> np.ndarray:
-    """Camera housing as one rounded rectangle covering every optic."""
+    """Axis-aligned housing covering every optic (no rotated min-area box)."""
     if not lenses.any():
         return np.zeros_like(lenses)
     ys, xs = np.where(lenses)
-    pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
-    if pts.shape[0] < 4:
-        hull = _filled_contour_around(lenses)
-        return fill_binary_holes(dilate_binary(hull, max(4.0, 0.028 * min_side)) & top & back)
-    (_cx, _cy), (rw, rh), ang = cv2.minAreaRect(pts)
-    rw = max(float(rw), 4.0) * 1.58
-    rh = max(float(rh), 4.0) * 1.58
-    side = max(rw, rh)
-    rw = max(rw, 0.80 * side)
-    rh = max(rh, 0.80 * side)
-    box = cv2.boxPoints(((_cx, _cy), (rw, rh), ang)).astype(np.int32)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    bw = max(1, x1 - x0 + 1)
+    bh = max(1, y1 - y0 + 1)
+    pad = max(3.0, 0.045 * float(min_side), 0.16 * float(min(bw, bh)))
+    x0 = max(0, int(round(x0 - pad)))
+    y0 = max(0, int(round(y0 - pad)))
+    x1 = min(lenses.shape[1] - 1, int(round(x1 + pad)))
+    y1 = min(lenses.shape[0] - 1, int(round(y1 + pad)))
     out = np.zeros(lenses.shape, dtype=np.uint8)
-    cv2.fillConvexPoly(out, box, 1)
-    rad = max(5, int(round(0.20 * min(rw, rh))))
+    cv2.rectangle(out, (x0, y0), (x1, y1), 1, thickness=cv2.FILLED)
+    rad = max(3, int(round(0.18 * min(x1 - x0 + 1, y1 - y0 + 1))))
     if rad % 2 == 0:
         rad += 1
     out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rad, rad)))

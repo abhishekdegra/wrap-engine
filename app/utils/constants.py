@@ -53,3 +53,6 @@ PRINT_MARGIN_MIN_PX = 0.0
 
 # Below this, show a warning (still return masks if a silhouette exists).
 DETECTION_CONFIDENCE_WARN = 0.55
+
+# Interactive preview longest side (export always uses original resolution).
+PREVIEW_MAX_SIDE = 1280
