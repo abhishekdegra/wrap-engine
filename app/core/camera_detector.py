@@ -36,9 +36,9 @@ def detect_camera(
         if holes.any() or island.any():
             combined = holes | island
             if holes.any():
-                combined = combined | _filled_contour_around(holes)
+                combined = combined | _smooth_rounded_island_polygon(holes, back, pad_px=max(8.0, 0.035 * min(height, width)))
             if _plausible_camera_island(combined, back):
-                mask, confidence = combined, 0.82 if (holes.any() and island.any()) else 0.7
+                mask, confidence = combined, 0.95 if (holes.any() and island.any()) else 0.85
 
     if not mask.any():
         mask, confidence = _rgb_camera_module(rgb, back, height, width)
@@ -63,7 +63,7 @@ def detect_camera(
     mask = dilate_binary(mask, safety_px) & back
 
     back_area = max(float(back.mean()), 1e-6)
-    if float(mask.mean()) / back_area > 0.16:
+    if float(mask.mean()) / back_area > 0.22:
         return np.zeros((height, width), dtype=bool), False, 0.0, warnings
     if not _plausible_camera_island(mask, back):
         return np.zeros((height, width), dtype=bool), False, 0.0, warnings
@@ -97,22 +97,19 @@ def _plausible_camera_island(mask: np.ndarray, back: np.ndarray) -> bool:
     frac_x = (cx - x0) / float(bw)
     frac_y = (cy - y0) / float(bh)
 
-    if aspect > 2.05:
+    if aspect > 2.45:
         return False
-    if w > 0.50 * bw or h > 0.42 * bh:
+    if w > 0.65 * bw or h > 0.52 * bh:
         return False
-    if frac < 0.0035 or frac > 0.145:
+    if frac < 0.0035 or frac > 0.20:
         return False
-    if extent < 0.50:
+    if extent < 0.45:
         return False
-    if frac_y > 0.40:
+    if frac_y > 0.48:
         return False
-    if h < 0.06 * bh and w > 0.28 * bw:
+    if h < 0.04 * bh and w > 0.35 * bw:
         return False
-    if w > 0.45 * bw and aspect > 1.9:
-        return False
-    # Center-of-back reject is for wide logos/rings, not a compact lens cluster.
-    if 0.42 < frac_x < 0.58 and (extent < 0.55 or w > 0.38 * bw):
+    if w > 0.55 * bw and aspect > 2.2:
         return False
     return True
 
@@ -137,32 +134,78 @@ def _regularize_camera_island(mask: np.ndarray, back: np.ndarray) -> np.ndarray:
     if not fitted.any():
         return island
     overlap = float(np.count_nonzero(fitted & island)) / max(float(np.count_nonzero(island)), 1.0)
-    if overlap < 0.82:
+    if overlap < 0.65:
         return island
     return fitted
 
 
 def _axis_aligned_module(island: np.ndarray, back: np.ndarray) -> np.ndarray:
+    return _smooth_rounded_island_polygon(island, back, pad_px=3.0, corner_ratio=0.22)
+
+
+def _smooth_rounded_island_polygon(
+    island: np.ndarray,
+    back: np.ndarray,
+    pad_px: float = 4.0,
+    corner_ratio: float = 0.22,
+) -> np.ndarray:
+    """Generate a clean, smooth rounded rectangle or circle covering the camera module and its bezel."""
+    if island is None or not island.any():
+        return np.zeros_like(back, dtype=bool)
     ys, xs = np.where(island)
-    if xs.size < 8:
-        return island
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    bw = max(1, x1 - x0 + 1)
-    bh = max(1, y1 - y0 + 1)
-    pad = max(2, int(round(0.06 * min(bw, bh))))
-    x0 = max(0, x0 - pad)
-    y0 = max(0, y0 - pad)
-    x1 = min(island.shape[1] - 1, x1 + pad)
-    y1 = min(island.shape[0] - 1, y1 + pad)
-    out = np.zeros(island.shape, dtype=np.uint8)
-    rect = (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
-    rad = max(3, int(round(0.18 * min(rect[2], rect[3]))))
-    cv2.rectangle(out, (x0, y0), (x1, y1), 1, thickness=cv2.FILLED)
-    k = rad if rad % 2 == 1 else rad + 1
-    k = max(3, k)
-    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    return fill_binary_holes(out.astype(bool)) & back
+    if xs.size < 6:
+        return island.astype(bool) & back.astype(bool)
+
+    x0 = max(0.0, float(xs.min()) - pad_px)
+    y0 = max(0.0, float(ys.min()) - pad_px)
+    x1 = min(float(island.shape[1] - 1), float(xs.max()) + pad_px)
+    y1 = min(float(island.shape[0] - 1), float(ys.max()) + pad_px)
+
+    w = max(4.0, x1 - x0)
+    h = max(4.0, y1 - y0)
+    aspect = max(w, h) / min(w, h)
+    area = float(island.sum())
+    circ = area / (np.pi * (min(w, h) / 2.0) ** 2 + 1e-6)
+
+    canvas = np.zeros(island.shape, dtype=np.uint8)
+
+    if aspect < 1.15 and 0.72 <= circ <= 1.30:
+        # Circular camera island / ring
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        cr = max(w, h) / 2.0
+        cv2.circle(canvas, (int(round(cx)), int(round(cy))), int(round(cr)), 255, thickness=cv2.FILLED)
+    else:
+        # Smooth rounded rectangle camera island
+        r = float(np.clip(corner_ratio * min(w, h), 4.0, 0.40 * min(w, h)))
+        num_arc = 20
+        segs = []
+        # Top edge
+        segs.append(np.stack([np.linspace(x0 + r, x1 - r, 32, endpoint=False), np.full(32, y0)], axis=1))
+        # TR arc
+        t_tr = np.linspace(-np.pi / 2, 0, num_arc, endpoint=False)
+        segs.append(np.stack([(x1 - r) + r * np.cos(t_tr), (y0 + r) + r * np.sin(t_tr)], axis=1))
+        # Right edge
+        segs.append(np.stack([np.full(32, x1), np.linspace(y0 + r, y1 - r, 32, endpoint=False)], axis=1))
+        # BR arc
+        t_br = np.linspace(0, np.pi / 2, num_arc, endpoint=False)
+        segs.append(np.stack([(x1 - r) + r * np.cos(t_br), (y1 - r) + r * np.sin(t_br)], axis=1))
+        # Bottom edge
+        segs.append(np.stack([np.linspace(x1 - r, x0 + r, 32, endpoint=False), np.full(32, y1)], axis=1))
+        # BL arc
+        t_bl = np.linspace(np.pi / 2, np.pi, num_arc, endpoint=False)
+        segs.append(np.stack([(x0 + r) + r * np.cos(t_bl), (y1 - r) + r * np.sin(t_bl)], axis=1))
+        # Left edge
+        segs.append(np.stack([np.full(32, x0), np.linspace(y1 - r, y0 + r, 32, endpoint=False)], axis=1))
+        # TL arc
+        t_tl = np.linspace(np.pi, 3 * np.pi / 2, num_arc, endpoint=False)
+        segs.append(np.stack([(x0 + r) + r * np.cos(t_tl), (y0 + r) + r * np.sin(t_tl)], axis=1))
+
+        poly = np.concatenate(segs, axis=0)
+        poly_i = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(canvas, [poly_i], 255)
+
+    return (canvas > 0) & back.astype(bool)
 
 
 def _smooth_island_contour(mask: np.ndarray) -> np.ndarray:
@@ -203,7 +246,7 @@ def _holes_inside_cover(
     holes = (alpha < 18) & (filled > 0)
     dist = cv2.distanceTransform(filled, cv2.DIST_L2, 5)
     holes = holes & (dist > 8)
-    return _keep_blobs(holes, height, width, min_frac=0.0002, max_frac=0.04, top_frac=0.5, region=outer)
+    return _keep_blobs(holes, height, width, min_frac=0.0002, max_frac=0.10, top_frac=0.52, region=outer)
 
 
 def _opaque_island(
@@ -467,7 +510,7 @@ def _optics_in_island_roi(
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
     span = int(max(x1 - x0 + 1, y1 - y0 + 1, 8))
-    pad = max(4, int(round(0.38 * span)))
+    pad = max(int(0.18 * min_side), int(round(1.5 * span)))
     rx0, rx1 = max(0, x0 - pad), min(width, x1 + pad + 1)
     ry0, ry1 = max(0, y0 - pad), min(height, y1 + pad + 1)
     roi = np.zeros_like(top)
@@ -483,10 +526,10 @@ def _compact_optics_bbox(mask: np.ndarray, min_side: float) -> bool:
     ys, xs = np.where(mask)
     w = int(xs.max() - xs.min() + 1)
     h = int(ys.max() - ys.min() + 1)
-    if max(w, h) > 0.28 * min_side:
+    if max(w, h) > 0.55 * min_side:
         return False
     aspect = max(w, h) / float(max(min(w, h), 1))
-    return aspect <= 2.2
+    return aspect <= 2.4
 
 
 def _snap_to_module_contour(
@@ -607,27 +650,15 @@ def _rounded_box_around_lenses(
     back: np.ndarray,
     min_side: float,
 ) -> np.ndarray:
-    """Axis-aligned housing covering every optic (no rotated min-area box)."""
+    """Axis-aligned housing covering every optic with smooth rounded corners."""
     if not lenses.any():
         return np.zeros_like(lenses)
     ys, xs = np.where(lenses)
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    bw = max(1, x1 - x0 + 1)
-    bh = max(1, y1 - y0 + 1)
-    pad = max(3.0, 0.045 * float(min_side), 0.16 * float(min(bw, bh)))
-    x0 = max(0, int(round(x0 - pad)))
-    y0 = max(0, int(round(y0 - pad)))
-    x1 = min(lenses.shape[1] - 1, int(round(x1 + pad)))
-    y1 = min(lenses.shape[0] - 1, int(round(y1 + pad)))
-    out = np.zeros(lenses.shape, dtype=np.uint8)
-    cv2.rectangle(out, (x0, y0), (x1, y1), 1, thickness=cv2.FILLED)
-    rad = max(3, int(round(0.18 * min(x1 - x0 + 1, y1 - y0 + 1))))
-    if rad % 2 == 0:
-        rad += 1
-    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rad, rad)))
-    island = fill_binary_holes(out.astype(bool)) & top & back
-    return fill_binary_holes(island | (lenses & back))
+    bw = max(1, int(xs.max() - xs.min() + 1))
+    bh = max(1, int(ys.max() - ys.min() + 1))
+    pad = max(4.0, 0.045 * float(min_side), 0.16 * float(min(bw, bh)))
+    island = _smooth_rounded_island_polygon(lenses, back & top, pad_px=pad, corner_ratio=0.22)
+    return fill_binary_holes(island | (lenses & back & top))
 
 
 def _hough_lenses(gray: np.ndarray, top: np.ndarray, min_side: float) -> np.ndarray:
@@ -637,15 +668,15 @@ def _hough_lenses(gray: np.ndarray, top: np.ndarray, min_side: float) -> np.ndar
     work = gray.copy()
     work[~top] = int(np.median(gray[top]))
     blur = cv2.GaussianBlur(work, (5, 5), 1.1)
-    min_r = max(3, int(round(0.012 * min_side)))
-    max_r = max(min_r + 2, int(round(0.075 * min_side)))
+    min_r = max(4, int(round(0.010 * min_side)))
+    max_r = max(min_r + 2, int(round(0.14 * min_side)))
     circles = cv2.HoughCircles(
         blur,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=float(max(6, min_r * 2)),
+        minDist=float(max(16, min_r * 2.0)),
         param1=70,
-        param2=14,
+        param2=18,
         minRadius=min_r,
         maxRadius=max_r,
     )
@@ -665,9 +696,7 @@ def _hough_lenses(gray: np.ndarray, top: np.ndarray, min_side: float) -> np.ndar
         inside = float(np.mean(gray[disk]))
         ring = ((xx - x) ** 2 + (yy - y) ** 2 <= ((r + 4) ** 2)) & ~disk & top
         outside = float(np.mean(gray[ring])) if ring.any() else med
-        if inside > med - 12.0:
-            continue
-        if outside - inside < 10.0:
+        if inside > med - 6.0 and abs(outside - inside) < 6.0:
             continue
         keep |= disk
     return keep
@@ -851,19 +880,26 @@ def _contrast_module(
 
 
 def _find_lenses(gray: np.ndarray, top: np.ndarray, back_area: float, min_side: float) -> np.ndarray:
-    """Near-black circular optics in the upper back panel."""
+    """Circular optics and camera lenses in the upper back panel."""
     if not top.any():
         return np.zeros(gray.shape, dtype=bool)
     local_med = float(np.median(gray[top]))
-    thresh = float(max(28.0, min(local_med - 28.0, 140.0)))
+    thresh = float(max(28.0, min(local_med - 18.0, 165.0)))
     dark = (gray < thresh) & top
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    top_eq = clahe.apply(gray)
+    blur = cv2.GaussianBlur(top_eq, (3, 3), 0)
+    _, otsu_dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark = (dark | (otsu_dark > 0)) & top
+
     u8 = dark.astype(np.uint8)
     n, labels, stats, cents = cv2.connectedComponentsWithStats(u8, 8)
     keep = np.zeros(gray.shape, dtype=bool)
-    min_area = max(6.0, 0.00018 * back_area)
-    max_area = max(min_area * 4.0, 0.035 * back_area)
-    min_d = max(2.0, 0.008 * min_side)
-    max_d = max(min_d + 1.0, 0.18 * min_side)
+    min_area = max(4.0, 0.00010 * back_area)
+    max_area = max(min_area * 8.0, 0.095 * back_area)
+    min_d = max(2.0, 0.006 * min_side)
+    max_d = max(min_d + 1.0, 0.28 * min_side)
 
     for i in range(1, n):
         area = float(stats[i, cv2.CC_STAT_AREA])
@@ -873,16 +909,10 @@ def _find_lenses(gray: np.ndarray, top: np.ndarray, back_area: float, min_side: 
             continue
         if min(w, h) < min_d or max(w, h) > max_d:
             continue
+        aspect = max(w, h) / max(min(w, h), 1.0)
+        if aspect > 1.85:
+            continue
         blob = labels == i
-        cnts, _ = cv2.findContours(blob.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            continue
-        peri = cv2.arcLength(cnts[0], True)
-        if peri < 1:
-            continue
-        circ = 4.0 * np.pi * area / (peri * peri)
-        if circ < 0.22:
-            continue
         keep |= blob
     return keep
 
