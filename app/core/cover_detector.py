@@ -279,10 +279,16 @@ def _pack_detection(
 
 def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
     """Four corners (TL, TR, BR, BL) of the inner back panel."""
+    from app.core.mask_generator import _contour_points, _fit_perspective_phone_quad
+
     ys, xs = np.where(back_bin)
     if ys.size == 0:
         h, w = back_bin.shape
         return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+
+    quad = _fit_perspective_phone_quad(_contour_points(back_bin))
+    if quad is not None:
+        return quad.astype(np.float32)
 
     x0, x1 = float(xs.min()), float(xs.max())
     y0, y1 = float(ys.min()), float(ys.max())
@@ -297,7 +303,7 @@ def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
     (_cx, _cy), (_rw, _rh), angle = cv2.minAreaRect(contour)
     tilt = abs(angle) % 90.0
     tilt = min(tilt, 90.0 - tilt)
-    if tilt < 6.0:
+    if tilt < 4.0:
         return aabb
     pts = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float32)
     return order_corners(pts)

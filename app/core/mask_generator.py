@@ -63,22 +63,38 @@ def masks_from_binaries(
     camera_bin: np.ndarray,
     feather_px: float,
 ) -> MaskSet:
-    """Antialiased masks from detected silhouettes — each contour is smoothed independently."""
+    """Antialiased masks from detected silhouettes — perspective-aware and uniform rim."""
     feather = float(feather_px)
     outer_src = fill_binary_holes(np.asarray(outer_bin).astype(bool))
     back_src = fill_binary_holes(np.asarray(back_bin).astype(bool)) & outer_src
-    outer_pts = _finish_wrap_polyline(_contour_points(outer_src))
-    inset_px = _median_boundary_inset(outer_src, back_src)
-    cap_outer = dilate_binary(outer_src, 2.4)
-    if outer_pts is not None and inset_px > 0.35:
-        back_pts = _offset_closed_polyline(outer_pts, -float(inset_px))
+
+    quad = _fit_perspective_phone_quad(_contour_points(outer_src))
+    if quad is not None:
+        w_top = np.linalg.norm(quad[1] - quad[0])
+        w_bot = np.linalg.norm(quad[2] - quad[3])
+        avg_w = (w_top + w_bot) / 2.0
+        radius_ratio = _estimate_quad_corner_radius(_contour_points(outer_src), quad)
+        outer_pts = rounded_quad_polyline(quad, radius_ratio=radius_ratio, num_arc_pts=36)
+        inset_px = _median_boundary_inset(outer_src, back_src)
+        bumper_px = float(max(inset_px, 0.020 * avg_w))
+        back_pts = _offset_closed_polyline(outer_pts, -bumper_px)
         outer_m = _rasterize_wrap_polyline(outer_pts, outer_src.shape, feather, cap_bin=None)
         back_m = _rasterize_wrap_polyline(back_pts, outer_src.shape, feather, cap_bin=None)
+        back_m = np.minimum(back_m, silhouette_to_aa_mask(back_src, feather))
         back_m = np.minimum(back_m, outer_m)
     else:
-        outer_m = silhouette_to_aa_mask(outer_src, feather)
-        back_m = silhouette_to_aa_mask(back_src, feather)
-        back_m = np.minimum(back_m, outer_m)
+        outer_pts = _finish_wrap_polyline(_contour_points(outer_src))
+        inset_px = _median_boundary_inset(outer_src, back_src)
+        if outer_pts is not None and inset_px > 0.35:
+            back_pts = _offset_closed_polyline(outer_pts, -float(inset_px))
+            outer_m = _rasterize_wrap_polyline(outer_pts, outer_src.shape, feather, cap_bin=None)
+            back_m = _rasterize_wrap_polyline(back_pts, outer_src.shape, feather, cap_bin=None)
+            back_m = np.minimum(back_m, outer_m)
+        else:
+            outer_m = silhouette_to_aa_mask(outer_src, feather)
+            back_m = silhouette_to_aa_mask(back_src, feather)
+            back_m = np.minimum(back_m, outer_m)
+
     camera_m = _camera_aa_mask(camera_bin, feather)
     back_m = np.minimum(back_m, outer_m)
     camera_m = np.minimum(camera_m, outer_m)
@@ -280,9 +296,10 @@ def _finish_wrap_polyline(pts: np.ndarray | None) -> np.ndarray | None:
     """Sub-pixel regularized phone contour — eliminates side button bumps and bottom shadow leaks."""
     if pts is None or pts.shape[0] < 16:
         return pts
-    reg = _fit_regularized_phone_contour(pts)
-    if reg is not None and reg.shape[0] >= 64:
-        return reg
+    quad = _fit_perspective_phone_quad(pts)
+    if quad is not None:
+        radius_ratio = _estimate_quad_corner_radius(pts, quad)
+        return rounded_quad_polyline(quad, radius_ratio=radius_ratio, num_arc_pts=28)
 
     peri = float(np.linalg.norm(np.diff(np.vstack([pts, pts[0]]), axis=0), axis=1).sum())
     dense_n = int(np.clip(peri * 1.25, 256, 4096))
@@ -295,9 +312,36 @@ def _finish_wrap_polyline(pts: np.ndarray | None) -> np.ndarray | None:
     return work
 
 
-def _fit_regularized_phone_contour(pts: np.ndarray) -> np.ndarray | None:
-    """Fit a clean, smooth, oriented rounded rectangle to contour points, ignoring button bumps & shadow leaks."""
-    if pts.shape[0] < 32:
+def _estimate_quad_corner_radius(pts: np.ndarray | None, quad: np.ndarray) -> float:
+    """Measure the physical corner radius of the phone case from contour points near 4 corners."""
+    if pts is None or pts.shape[0] < 32:
+        return 0.126
+
+    w_top = np.linalg.norm(quad[1] - quad[0])
+    w_bot = np.linalg.norm(quad[2] - quad[3])
+    avg_w = float((w_top + w_bot) / 2.0)
+    if avg_w < 10.0:
+        return 0.126
+
+    r_candidates: list[float] = []
+    for corner in quad:
+        dist = np.linalg.norm(pts - corner, axis=1)
+        close_pts = pts[dist < 0.26 * avg_w]
+        if close_pts.shape[0] >= 8:
+            fit = _fit_circle(close_pts)
+            if fit is not None:
+                _cx, _cy, r = fit
+                if 0.110 * avg_w <= r <= 0.145 * avg_w:
+                    r_candidates.append(float(r / avg_w))
+
+    if r_candidates:
+        return float(np.median(r_candidates))
+    return 0.126
+
+
+def _fit_perspective_phone_quad(pts: np.ndarray | None) -> np.ndarray | None:
+    """Fit 4 robust edge lines to phone contour in perspective space to handle trapezoid taper."""
+    if pts is None or pts.shape[0] < 32:
         return None
 
     pts_f = pts.astype(np.float32).reshape(-1, 1, 2)
@@ -319,74 +363,157 @@ def _fit_regularized_phone_contour(pts: np.ndarray) -> np.ndarray | None:
     u = dx * cos_a + dy * sin_a
     v = -dx * sin_a + dy * cos_a
 
-    mid_h = 0.25 * rh
+    mid_h = 0.32 * rh
+    mid_w = 0.32 * rw
     left_mask = (u < 0) & (np.abs(v) < mid_h)
     right_mask = (u > 0) & (np.abs(v) < mid_h)
-
-    mid_w = 0.20 * rw
     top_mask = (v < 0) & (np.abs(u) < mid_w)
     bot_mask = (v > 0) & (np.abs(u) < mid_w)
 
     if not (left_mask.any() and right_mask.any() and top_mask.any() and bot_mask.any()):
         return None
 
-    u_left = float(np.percentile(u[left_mask], 75))
-    u_right = float(np.percentile(u[right_mask], 25))
-    v_top = float(np.percentile(v[top_mask], 75))
-    v_bot = float(np.percentile(v[bot_mask], 25))
+    def robust_line_fit(subset_pts, is_vertical=True):
+        if subset_pts.shape[0] < 6:
+            return None
+        vx, vy, x0, y0 = cv2.fitLine(subset_pts.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01)
+        d = np.array([float(vx.flat[0]), float(vy.flat[0])], dtype=np.float64)
+        p = np.array([float(x0.flat[0]), float(y0.flat[0])], dtype=np.float64)
+        norm = np.linalg.norm(d)
+        if norm < 1e-6:
+            return None
+        d = d / norm
+        if is_vertical and d[1] < 0:
+            d = -d
+        elif not is_vertical and d[0] < 0:
+            d = -d
+        return p, d
 
-    w_fit = max(u_right - u_left, 10.0)
-    h_fit = max(v_bot - v_top, 10.0)
+    res_l = robust_line_fit(pts_2d[left_mask], is_vertical=True)
+    res_r = robust_line_fit(pts_2d[right_mask], is_vertical=True)
+    res_t = robust_line_fit(pts_2d[top_mask], is_vertical=False)
+    res_b = robust_line_fit(pts_2d[bot_mask], is_vertical=False)
 
-    u_mid = (u_left + u_right) / 2.0
-    v_mid = (v_top + v_bot) / 2.0
-    cx_fit = cx0 + u_mid * cos_a - v_mid * sin_a
-    cy_fit = cy0 + u_mid * sin_a + v_mid * cos_a
+    if res_l is None or res_r is None or res_t is None or res_b is None:
+        return None
 
-    r_est = 0.12 * w_fit
-    c_tl = (u < u_left + r_est * 1.3) & (v < v_top + r_est * 1.3)
-    if c_tl.any() and c_tl.sum() >= 5:
-        d_tl = np.sqrt((u[c_tl] - (u_left + r_est)) ** 2 + (v[c_tl] - (v_top + r_est)) ** 2)
-        r_measured = float(np.median(d_tl))
-        if 0.06 * w_fit <= r_measured <= 0.20 * w_fit:
-            r_est = r_measured
+    p_left, d_left = res_l
+    p_right, d_right = res_r
+    p_top, d_top = res_t
+    p_bot, d_bot = res_b
 
-    hw = w_fit / 2.0
-    hh = h_fit / 2.0
-    r = float(np.clip(r_est, 0.07 * w_fit, 0.18 * w_fit))
+    def line_intersection(p1, d1, p2, d2):
+        mat = np.column_stack([d1, -d2])
+        det = np.linalg.det(mat)
+        if abs(det) < 1e-6:
+            return (p1 + p2) / 2.0
+        t = np.linalg.solve(mat, p2 - p1)[0]
+        return p1 + t * d1
 
-    num_arc = 32
-    num_side = 64
-    segs: list[np.ndarray] = []
+    v_tl = line_intersection(p_top, d_top, p_left, d_left)
+    v_tr = line_intersection(p_top, d_top, p_right, d_right)
+    v_br = line_intersection(p_bot, d_bot, p_right, d_right)
+    v_bl = line_intersection(p_bot, d_bot, p_left, d_left)
 
-    # Top edge: left to right
-    segs.append(np.stack([np.linspace(-hw + r, hw - r, num_side, endpoint=False), np.full(num_side, -hh)], axis=1))
-    # TR arc
-    t_tr = np.linspace(-np.pi / 2, 0, num_arc, endpoint=False)
-    segs.append(np.stack([(hw - r) + r * np.cos(t_tr), (-hh + r) + r * np.sin(t_tr)], axis=1))
-    # Right edge: top to bottom
-    segs.append(np.stack([np.full(num_side, hw), np.linspace(-hh + r, hh - r, num_side, endpoint=False)], axis=1))
-    # BR arc
-    t_br = np.linspace(0, np.pi / 2, num_arc, endpoint=False)
-    segs.append(np.stack([(hw - r) + r * np.cos(t_br), (hh - r) + r * np.sin(t_br)], axis=1))
-    # Bottom edge: right to left
-    segs.append(np.stack([np.linspace(hw - r, -hw + r, num_side, endpoint=False), np.full(num_side, hh)], axis=1))
-    # BL arc
-    t_bl = np.linspace(np.pi / 2, np.pi, num_arc, endpoint=False)
-    segs.append(np.stack([(-hw + r) + r * np.cos(t_bl), (hh - r) + r * np.sin(t_bl)], axis=1))
-    # Left edge: bottom to top
-    segs.append(np.stack([np.full(num_side, -hw), np.linspace(hh - r, -hh + r, num_side, endpoint=False)], axis=1))
-    # TL arc
-    t_tl = np.linspace(np.pi, 3 * np.pi / 2, num_arc, endpoint=False)
-    segs.append(np.stack([(-hw + r) + r * np.cos(t_tl), (-hh + r) + r * np.sin(t_tl)], axis=1))
+    return np.array([v_tl, v_tr, v_br, v_bl], dtype=np.float64)
 
-    local_poly = np.concatenate(segs, axis=0)
-    world_poly = np.stack([
-        cx_fit + local_poly[:, 0] * cos_a - local_poly[:, 1] * sin_a,
-        cy_fit + local_poly[:, 0] * sin_a + local_poly[:, 1] * cos_a,
-    ], axis=1)
 
-    return world_poly
+def inset_quad(quad: np.ndarray, inset_px: float) -> np.ndarray:
+    """Offset each quadrilateral edge inward by exactly inset_px perpendicular distance."""
+    quad = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    centroid = quad.mean(axis=0)
+    shifted_lines = []
+    for i in range(4):
+        p1 = quad[i]
+        p2 = quad[(i + 1) % 4]
+        tangent = p2 - p1
+        length = np.linalg.norm(tangent)
+        u_tangent = tangent / max(length, 1e-6)
+        n = np.array([-u_tangent[1], u_tangent[0]])
+        mid = (p1 + p2) / 2.0
+        if np.dot(n, centroid - mid) < 0:
+            n = -n
+        p_shifted = p1 + n * float(inset_px)
+        shifted_lines.append((p_shifted, u_tangent))
+
+    def line_intersection(p1, d1, p2, d2):
+        mat = np.column_stack([d1, -d2])
+        det = np.linalg.det(mat)
+        if abs(det) < 1e-6:
+            return (p1 + p2) / 2.0
+        t = np.linalg.solve(mat, p2 - p1)[0]
+        return p1 + t * d1
+
+    v0_new = line_intersection(shifted_lines[3][0], shifted_lines[3][1], shifted_lines[0][0], shifted_lines[0][1])
+    v1_new = line_intersection(shifted_lines[0][0], shifted_lines[0][1], shifted_lines[1][0], shifted_lines[1][1])
+    v2_new = line_intersection(shifted_lines[1][0], shifted_lines[1][1], shifted_lines[2][0], shifted_lines[2][1])
+    v3_new = line_intersection(shifted_lines[2][0], shifted_lines[2][1], shifted_lines[3][0], shifted_lines[3][1])
+    return np.array([v0_new, v1_new, v2_new, v3_new], dtype=np.float64)
+
+
+def rounded_quad_polyline(quad: np.ndarray, radius_ratio: float = 0.09, num_arc_pts: int = 24) -> np.ndarray:
+    """Generate dense, smooth closed polyline with true inward circular corner arcs."""
+    quad = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    w_top = np.linalg.norm(quad[1] - quad[0])
+    w_bot = np.linalg.norm(quad[2] - quad[3])
+    avg_w = (w_top + w_bot) / 2.0
+    r = float(radius_ratio * avg_w)
+
+    segs = []
+    centroid = quad.mean(axis=0)
+
+    for i in range(4):
+        v_prev = quad[(i - 1) % 4]
+        v_curr = quad[i]
+        v_next = quad[(i + 1) % 4]
+
+        d_in = v_curr - v_prev
+        len_in = np.linalg.norm(d_in)
+        u_in = d_in / max(len_in, 1e-6)
+
+        d_out = v_next - v_curr
+        len_out = np.linalg.norm(d_out)
+        u_out = d_out / max(len_out, 1e-6)
+
+        n_in = np.array([-u_in[1], u_in[0]])
+        if np.dot(n_in, centroid - v_curr) < 0:
+            n_in = -n_in
+
+        cos_corner = np.clip(-np.dot(u_in, u_out), -1.0, 1.0)
+        half_angle = np.arccos(cos_corner) / 2.0
+        t_dist = min(r / max(np.tan(half_angle), 1e-4), 0.35 * min(len_in, len_out))
+        actual_r = t_dist * np.tan(half_angle)
+
+        p_in = v_curr - t_dist * u_in
+        p_out = v_curr + t_dist * u_out
+
+        center = p_in + n_in * actual_r
+
+        v_start = p_in - center
+        v_end = p_out - center
+        ang_start = np.arctan2(v_start[1], v_start[0])
+        ang_end = np.arctan2(v_end[1], v_end[0])
+
+        diff = (ang_end - ang_start + np.pi) % (2 * np.pi) - np.pi
+        angles = ang_start + diff * np.linspace(0.0, 1.0, num_arc_pts, endpoint=False)
+        arc = center + actual_r * np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        segs.append(arc)
+
+        next_v = v_next
+        next_d_in = next_v - v_curr
+        next_len_in = np.linalg.norm(next_d_in)
+        next_u_in = next_d_in / max(next_len_in, 1e-6)
+        next_d_out = quad[(i + 2) % 4] - next_v
+        next_u_out = next_d_out / max(np.linalg.norm(next_d_out), 1e-6)
+        next_cos = np.clip(-np.dot(next_u_in, next_u_out), -1.0, 1.0)
+        next_t = min(r / max(np.tan(np.arccos(next_cos) / 2.0), 1e-4), 0.35 * min(next_len_in, np.linalg.norm(next_d_out)))
+        next_p_in = next_v - next_t * next_u_in
+
+        if np.linalg.norm(next_p_in - p_out) > 1.0:
+            straight = np.linspace(p_out, next_p_in, 16, endpoint=False)
+            segs.append(straight)
+
+    return np.concatenate(segs, axis=0)
 
 
 def _corner_proximity_mask(pts: np.ndarray, frac: float = 0.18) -> np.ndarray:
