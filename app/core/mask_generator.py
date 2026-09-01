@@ -72,15 +72,13 @@ def masks_from_binaries(
     if quad is not None:
         w_top = np.linalg.norm(quad[1] - quad[0])
         w_bot = np.linalg.norm(quad[2] - quad[3])
-        avg_w = (w_top + w_bot) / 2.0
-        radius_ratio = _estimate_quad_corner_radius(_contour_points(outer_src), quad)
-        outer_pts = rounded_quad_polyline(quad, radius_ratio=radius_ratio, num_arc_pts=36)
+        avg_w = float((w_top + w_bot) / 2.0)
+        outer_pts = rounded_quad_polyline(quad, radius_ratio=0.126, num_arc_pts=36)
         inset_px = _median_boundary_inset(outer_src, back_src)
         bumper_px = float(max(inset_px, 0.020 * avg_w))
         back_pts = _offset_closed_polyline(outer_pts, -bumper_px)
         outer_m = _rasterize_wrap_polyline(outer_pts, outer_src.shape, feather, cap_bin=None)
         back_m = _rasterize_wrap_polyline(back_pts, outer_src.shape, feather, cap_bin=None)
-        back_m = np.minimum(back_m, silhouette_to_aa_mask(back_src, feather))
         back_m = np.minimum(back_m, outer_m)
     else:
         outer_pts = _finish_wrap_polyline(_contour_points(outer_src))
@@ -312,31 +310,39 @@ def _finish_wrap_polyline(pts: np.ndarray | None) -> np.ndarray | None:
     return work
 
 
-def _estimate_quad_corner_radius(pts: np.ndarray | None, quad: np.ndarray) -> float:
-    """Measure the physical corner radius of the phone case from contour points near 4 corners."""
-    if pts is None or pts.shape[0] < 32:
-        return 0.126
-
+def _estimate_quad_corner_radii(pts: np.ndarray | None, quad: np.ndarray) -> list[float]:
+    """Measure the physical corner radius for all 4 corners (TL, TR, BR, BL) individually."""
     w_top = np.linalg.norm(quad[1] - quad[0])
     w_bot = np.linalg.norm(quad[2] - quad[3])
     avg_w = float((w_top + w_bot) / 2.0)
-    if avg_w < 10.0:
-        return 0.126
+    default_r = 0.126 * avg_w
 
-    r_candidates: list[float] = []
+    if pts is None or pts.shape[0] < 32 or avg_w < 10.0:
+        return [default_r, default_r, default_r, default_r]
+
+    radii = []
     for corner in quad:
         dist = np.linalg.norm(pts - corner, axis=1)
         close_pts = pts[dist < 0.26 * avg_w]
+        r_val = default_r
         if close_pts.shape[0] >= 8:
             fit = _fit_circle(close_pts)
             if fit is not None:
                 _cx, _cy, r = fit
                 if 0.110 * avg_w <= r <= 0.145 * avg_w:
-                    r_candidates.append(float(r / avg_w))
+                    r_val = float(r)
+        radii.append(r_val)
 
-    if r_candidates:
-        return float(np.median(r_candidates))
-    return 0.126
+    med_r = float(np.median(radii)) if radii else default_r
+    return [r if 0.110 * avg_w <= r <= 0.145 * avg_w else med_r for r in radii]
+
+
+def _estimate_quad_corner_radius(pts: np.ndarray | None, quad: np.ndarray) -> float:
+    radii = _estimate_quad_corner_radii(pts, quad)
+    w_top = np.linalg.norm(quad[1] - quad[0])
+    w_bot = np.linalg.norm(quad[2] - quad[3])
+    avg_w = float((w_top + w_bot) / 2.0)
+    return float(np.median(radii) / max(avg_w, 1.0))
 
 
 def _fit_perspective_phone_quad(pts: np.ndarray | None) -> np.ndarray | None:
@@ -363,12 +369,14 @@ def _fit_perspective_phone_quad(pts: np.ndarray | None) -> np.ndarray | None:
     u = dx * cos_a + dy * sin_a
     v = -dx * sin_a + dy * cos_a
 
-    mid_h = 0.32 * rh
-    mid_w = 0.32 * rw
+    mid_h = 0.35 * rh
+    mid_w = 0.35 * rw
     left_mask = (u < 0) & (np.abs(v) < mid_h)
     right_mask = (u > 0) & (np.abs(v) < mid_h)
     top_mask = (v < 0) & (np.abs(u) < mid_w)
-    bot_mask = (v > 0) & (np.abs(u) < mid_w)
+    bot_mask = (v > 0) & (np.abs(u) < mid_w) & (np.abs(u) > 0.06 * rw)
+    if not bot_mask.any():
+        bot_mask = (v > 0) & (np.abs(u) < mid_w)
 
     if not (left_mask.any() and right_mask.any() and top_mask.any() and bot_mask.any()):
         return None
@@ -383,6 +391,15 @@ def _fit_perspective_phone_quad(pts: np.ndarray | None) -> np.ndarray | None:
         if norm < 1e-6:
             return None
         d = d / norm
+        n = np.array([-d[1], d[0]])
+        dist = np.abs(np.dot(subset_pts - p, n))
+        inliers = subset_pts[dist < max(3.0, np.median(dist) * 2.5)]
+        if inliers.shape[0] >= 6:
+            vx, vy, x0, y0 = cv2.fitLine(inliers.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01)
+            d = np.array([float(vx.flat[0]), float(vy.flat[0])], dtype=np.float64)
+            p = np.array([float(x0.flat[0]), float(y0.flat[0])], dtype=np.float64)
+            d = d / max(np.linalg.norm(d), 1e-6)
+
         if is_vertical and d[1] < 0:
             d = -d
         elif not is_vertical and d[0] < 0:
@@ -451,18 +468,28 @@ def inset_quad(quad: np.ndarray, inset_px: float) -> np.ndarray:
     return np.array([v0_new, v1_new, v2_new, v3_new], dtype=np.float64)
 
 
-def rounded_quad_polyline(quad: np.ndarray, radius_ratio: float = 0.09, num_arc_pts: int = 24) -> np.ndarray:
+def rounded_quad_polyline(
+    quad: np.ndarray,
+    radius_ratio: float | list[float] = 0.126,
+    num_arc_pts: int = 36,
+) -> np.ndarray:
     """Generate dense, smooth closed polyline with true inward circular corner arcs."""
     quad = np.asarray(quad, dtype=np.float64).reshape(4, 2)
     w_top = np.linalg.norm(quad[1] - quad[0])
     w_bot = np.linalg.norm(quad[2] - quad[3])
     avg_w = (w_top + w_bot) / 2.0
-    r = float(radius_ratio * avg_w)
+
+    if isinstance(radius_ratio, (list, tuple, np.ndarray)):
+        r_list = [float(r) if float(r) > 1.0 else float(r) * avg_w for r in radius_ratio]
+    else:
+        r_val = float(radius_ratio) if float(radius_ratio) > 1.0 else float(radius_ratio) * avg_w
+        r_list = [r_val] * 4
 
     segs = []
     centroid = quad.mean(axis=0)
 
     for i in range(4):
+        r = r_list[i]
         v_prev = quad[(i - 1) % 4]
         v_curr = quad[i]
         v_next = quad[(i + 1) % 4]
