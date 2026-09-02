@@ -13,6 +13,9 @@ APP_VERSION = "1.0.0"
 # Set True to show mask debug previews in the main window.
 DEBUG_MODE = False
 
+# Set True to emit camera-detection debug overlays (rim contour, openings, candidates).
+CAMERA_DEBUG = False
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ASSETS_DIR = PROJECT_ROOT / "assets"
 COVERS_DIR = ASSETS_DIR / "covers"

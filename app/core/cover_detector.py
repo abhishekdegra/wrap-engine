@@ -14,6 +14,7 @@ import numpy as np
 from app.core.camera_detector import detect_camera
 from app.core.mask_generator import (
     MaskSet,
+    dilate_binary,
     inset_binary,
     inset_smooth,
     masks_from_binaries,
@@ -46,6 +47,10 @@ class CoverDetection:
     camera_found: bool = False
     debug_images: dict[str, np.ndarray] = field(default_factory=dict)
     raw_outer: np.ndarray | None = None
+    # Refined camera rim contour (Nx2 float64 array of [x,y] points), or None.
+    camera_contour: np.ndarray | None = None
+    # List of binary masks for individual lens/flash openings inside the camera rim.
+    camera_openings: list[np.ndarray] = field(default_factory=list)
 
 
 def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
@@ -102,12 +107,21 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
             "Try a flatter, front-facing photo of the case."
         )
 
-    camera, camera_found, cam_conf, cam_warnings = detect_camera(
+    cam_res = detect_camera(
         cover_rgba, outer_filled, back_full, safety_px
     )
+    if len(cam_res) == 7:
+        camera, camera_found, cam_conf, cam_warnings, cam_contour, cam_openings, cam_outer_rim = cam_res
+    else:
+        camera, camera_found, cam_conf, cam_warnings, cam_contour, cam_openings = cam_res[:6]
+        cam_outer_rim = None
+
     if camera_found and cam_conf < 0.48:
         camera = np.zeros_like(back_full)
         camera_found = False
+        cam_contour = None
+        cam_openings = []
+        cam_outer_rim = None
         cam_warnings = list(cam_warnings) + [
             "Camera detection was uncertain, so it was not applied. "
             "Use “Mark camera area” if the cutout is missing."
@@ -125,6 +139,9 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
         # Camera exclusion must never wipe the panel — drop auto camera instead of failing.
         camera = np.zeros_like(back_full)
         camera_found = False
+        cam_contour = None
+        cam_openings = []
+        cam_outer_rim = None
         cam_warnings = [
             "Automatic camera exclusion removed too much of the back panel, so it was skipped. "
             "Mark the camera area if needed."
@@ -142,7 +159,11 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
         has_alpha,
         cam_warnings,
         raw_outer=raw_outer,
+        camera_contour=cam_contour,
+        camera_openings=cam_openings,
+        camera_outer_rim=cam_outer_rim,
     )
+
 
 
 def apply_manual_camera(
@@ -240,8 +261,14 @@ def _pack_detection(
     has_alpha: bool,
     extra_warnings: list[str],
     raw_outer: np.ndarray | None = None,
+    camera_contour: np.ndarray | None = None,
+    camera_openings: list[np.ndarray] | None = None,
+    camera_outer_rim: np.ndarray | None = None,
 ) -> CoverDetection:
-    masks = masks_from_binaries(outer_filled, back_full, camera, MASK_FEATHER_PX)
+    masks = masks_from_binaries(
+        outer_filled, back_full, camera, MASK_FEATHER_PX,
+        camera_contour=camera_contour,
+    )
     confidence, warnings = _score(
         cover_rgba, outer_filled, back_full, camera_found, has_alpha
     )
@@ -261,6 +288,30 @@ def _pack_detection(
         "edge_exclusion": mask_to_preview(masks.edge_exclusion),
     }
 
+    # --- Camera debug overlays ---
+    debug["camera_rim_debug"] = _build_camera_rim_debug(
+        cover_rgba, back_full, camera, camera_contour, camera_openings, camera_outer_rim
+    )
+
+    if camera_contour is not None and camera_contour.shape[0] >= 3:
+        rim_overlay = cover_rgba.copy()
+        pts_draw = np.round(camera_contour).astype(np.int32).reshape(-1, 1, 2)
+        rgb_contig = np.ascontiguousarray(rim_overlay[..., :3])
+        cv2.polylines(rgb_contig, [pts_draw], True, (0, 255, 255), thickness=2, lineType=cv2.LINE_AA)
+        rim_overlay[..., :3] = rgb_contig
+        debug["camera_rim_contour"] = rim_overlay
+
+    openings_list = camera_openings if camera_openings else []
+    if openings_list:
+        open_overlay = cover_rgba.copy()
+        colors = [(255, 0, 200), (0, 200, 255), (200, 255, 0), (255, 128, 0)]
+        for idx, opening in enumerate(openings_list):
+            color = colors[idx % len(colors)]
+            open_overlay[..., :3] = contour_overlay(
+                open_overlay, opening, color
+            )[..., :3]
+        debug["camera_openings"] = open_overlay
+
     return CoverDetection(
         masks=masks,
         outer_bin=outer_filled,
@@ -274,7 +325,63 @@ def _pack_detection(
         camera_found=camera_found,
         debug_images=debug,
         raw_outer=raw,
+        camera_contour=camera_contour,
+        camera_openings=openings_list,
     )
+
+
+def _build_camera_rim_debug(
+    cover_rgba: np.ndarray,
+    back_full: np.ndarray,
+    camera_bin: np.ndarray,
+    camera_contour: np.ndarray | None,
+    camera_openings: list[np.ndarray] | None,
+    camera_outer_rim: np.ndarray | None = None,
+) -> np.ndarray:
+    """Debug visualization:
+    - RED = outer camera-rim boundary
+    - GREEN = inner rim / camera opening boundary (final artwork cutout)
+    - CYAN overlay = printable camera-rim top surface
+    - BLUE = internal optics / flash openings
+    """
+    debug = cover_rgba.copy()
+    rgb = np.ascontiguousarray(debug[..., :3])
+    height, width = rgb.shape[:2]
+
+    # 1. CYAN band = printable raised rim surface (between outer rim and inner opening)
+    if camera_outer_rim is not None and camera_contour is not None:
+        m_out = np.zeros((height, width), dtype=np.uint8)
+        m_in = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(m_out, [np.round(camera_outer_rim).astype(np.int32).reshape(-1, 1, 2)], 1)
+        cv2.fillPoly(m_in, [np.round(camera_contour).astype(np.int32).reshape(-1, 1, 2)], 1)
+        rim_band = (m_out > 0) & (m_in == 0) & back_full
+        if rim_band.any():
+            rgb[rim_band, 0] = (rgb[rim_band, 0] * 0.35).astype(np.uint8)
+            rgb[rim_band, 1] = np.clip(rgb[rim_band, 1].astype(int) + 100, 0, 255)
+            rgb[rim_band, 2] = np.clip(rgb[rim_band, 2].astype(int) + 150, 0, 255)
+
+    # 2. BLUE = internal camera lenses / flash openings
+    if camera_openings:
+        for op in camera_openings:
+            ys_o, xs_o = np.where(op)
+            if ys_o.size > 0:
+                rgb[ys_o, xs_o, 2] = np.clip(rgb[ys_o, xs_o, 2].astype(int) + 180, 0, 255)
+                rgb[ys_o, xs_o, 0] = (rgb[ys_o, xs_o, 0] * 0.2).astype(np.uint8)
+                rgb[ys_o, xs_o, 1] = (rgb[ys_o, xs_o, 1] * 0.2).astype(np.uint8)
+
+    # 3. RED = Outer camera-rim boundary
+    if camera_outer_rim is not None and camera_outer_rim.shape[0] >= 3:
+        pts_out = np.round(camera_outer_rim).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(rgb, [pts_out], True, (255, 60, 0), thickness=2, lineType=cv2.LINE_AA)
+
+    # 4. GREEN = Inner rim / camera opening boundary (final artwork cutout)
+    if camera_contour is not None and camera_contour.shape[0] >= 3:
+        pts_in = np.round(camera_contour).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(rgb, [pts_in], True, (0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+
+    debug[..., :3] = rgb
+    return debug
+
 
 
 def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
@@ -311,14 +418,12 @@ def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
 
 def order_corners(pts: np.ndarray) -> np.ndarray:
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
-    ordered = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    ordered[0] = pts[int(np.argmin(s))]
-    ordered[2] = pts[int(np.argmax(s))]
-    d = pts[:, 0] - pts[:, 1]
-    ordered[1] = pts[int(np.argmax(d))]
-    ordered[3] = pts[int(np.argmin(d))]
-    return ordered
+    ysort = pts[np.argsort(pts[:, 1])]
+    top_two = ysort[:2]
+    bot_two = ysort[2:]
+    tl, tr = top_two[np.argsort(top_two[:, 0])]
+    bl, br = bot_two[np.argsort(bot_two[:, 0])]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
 def _outer_from_alpha(alpha: np.ndarray) -> np.ndarray:

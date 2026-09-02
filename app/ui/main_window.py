@@ -9,7 +9,9 @@ from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -21,11 +23,13 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
+
 
 from app.core.cover_adjust import CoverLook
 from app.core.cover_processor import CoverProcessor, ProcessingResult
@@ -40,10 +44,14 @@ DEBUG_VIEWS = (
     ("printable_boundary", "3. Final printable boundary"),
     ("final_print_mask", "4. Final mask"),
     ("camera_exclusion", "5. Camera exclusion"),
-    ("final_composite", "6. Final composite"),
-    ("edge_exclusion", "7. Side wall / edge"),
-    ("artwork_before_mask", "8. Artwork before mask"),
+    ("camera_rim_debug", "6. Camera Rim Debug (Red=Outer Rim, Green=Cutout, Cyan=Printable Rim, Blue=Optics)"),
+    ("camera_rim_contour", "7. Camera Rim Contour Overlay"),
+    ("camera_openings", "8. Internal Lenses / Flash"),
+    ("final_composite", "9. Final composite"),
+    ("edge_exclusion", "10. Side wall / edge"),
+    ("artwork_before_mask", "11. Artwork before mask"),
 )
+
 
 
 class CoverWorker(QObject):
@@ -127,6 +135,8 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
 
         self.final_preview = ImagePreview("Final mockup", zoomable=True)
+        self.final_preview.shape_selected.connect(self._on_shape_selected)
+        self.final_preview.shape_updated.connect(self._on_shape_updated)
         final = self._mockup_panel()
         right = self._build_controls()
 
@@ -310,8 +320,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setSpacing(6)
         hint = QLabel(
-            "Wrap hides while you edit. Move the cutout, or draw a new one. "
-            "Wheel zooms · space-drag pans · arrows nudge. Apply to show the wrap again."
+            "Wrap hides while you edit. Select/move shapes, drag handles, or draw a new one. "
+            "Wheel zooms · space-drag pans · delete key removes. Apply when ready."
         )
         hint.setWordWrap(True)
         hint.setObjectName("hint")
@@ -320,11 +330,14 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(4)
         tools = (
-            ("move", "Move"),
+            ("move", "Move / Select"),
             ("rect", "Rectangle"),
             ("roundrect", "Rounded"),
+            ("circle", "Circle"),
             ("ellipse", "Ellipse"),
+            ("pill", "Capsule / Pill"),
             ("polygon", "Polygon"),
+            ("freeform", "Freeform"),
             ("brush", "Brush"),
             ("eraser", "Eraser"),
         )
@@ -337,8 +350,78 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _=False, k=key: self._on_tool(k))
             self._tool_group.addButton(btn)
             self._tool_buttons[key] = btn
-            grid.addWidget(btn, i // 3, i % 3)
+            grid.addWidget(btn, i // 2, i % 2)
         layout.addLayout(grid)
+
+        # Selected Shape Transform & Properties Panel
+        self._shape_prop_group = QGroupBox("Selected shape controls")
+        self._shape_prop_group.setObjectName("subGroup")
+        sp_layout = QVBoxLayout(self._shape_prop_group)
+        sp_layout.setContentsMargins(6, 6, 6, 6)
+        sp_layout.setSpacing(4)
+
+        grid_sp = QGridLayout()
+        grid_sp.setSpacing(4)
+
+        grid_sp.addWidget(QLabel("X:"), 0, 0)
+        self.spin_x = QSpinBox()
+        self.spin_x.setRange(-9999, 9999)
+        grid_sp.addWidget(self.spin_x, 0, 1)
+
+        grid_sp.addWidget(QLabel("Y:"), 0, 2)
+        self.spin_y = QSpinBox()
+        self.spin_y.setRange(-9999, 9999)
+        grid_sp.addWidget(self.spin_y, 0, 3)
+
+        grid_sp.addWidget(QLabel("W:"), 1, 0)
+        self.spin_w = QSpinBox()
+        self.spin_w.setRange(2, 9999)
+        grid_sp.addWidget(self.spin_w, 1, 1)
+
+        grid_sp.addWidget(QLabel("H:"), 1, 2)
+        self.spin_h = QSpinBox()
+        self.spin_h.setRange(2, 9999)
+        grid_sp.addWidget(self.spin_h, 1, 3)
+
+        grid_sp.addWidget(QLabel("Rot:"), 2, 0)
+        self.spin_rot = QDoubleSpinBox()
+        self.spin_rot.setRange(-180.0, 180.0)
+        self.spin_rot.setSuffix("°")
+        grid_sp.addWidget(self.spin_rot, 2, 1)
+
+        grid_sp.addWidget(QLabel("Radius:"), 2, 2)
+        self.spin_rad = QSpinBox()
+        self.spin_rad.setRange(0, 999)
+        self.spin_rad.setSuffix("px")
+        grid_sp.addWidget(self.spin_rad, 2, 3)
+
+        sp_layout.addLayout(grid_sp)
+
+        self.chk_aspect = QCheckBox("Lock Aspect Ratio")
+        sp_layout.addWidget(self.chk_aspect)
+
+        btn_row = QHBoxLayout()
+        self.btn_reset_transform = QPushButton("Reset Transform")
+        self.btn_reset_transform.setObjectName("zoomBtn")
+        self.btn_delete_shape = QPushButton("Delete Shape")
+        self.btn_delete_shape.setObjectName("zoomBtn")
+        btn_row.addWidget(self.btn_reset_transform)
+        btn_row.addWidget(self.btn_delete_shape)
+        sp_layout.addLayout(btn_row)
+
+        layout.addWidget(self._shape_prop_group)
+        self._shape_prop_group.setEnabled(False)
+
+        # Wire spinbox events
+        self.spin_x.valueChanged.connect(lambda v: self.final_preview.update_selected_shape(x=v))
+        self.spin_y.valueChanged.connect(lambda v: self.final_preview.update_selected_shape(y=v))
+        self.spin_w.valueChanged.connect(lambda v: self.final_preview.update_selected_shape(width=v))
+        self.spin_h.valueChanged.connect(lambda v: self.final_preview.update_selected_shape(height=v))
+        self.spin_rot.valueChanged.connect(lambda v: self.final_preview.update_selected_shape(rotation=v))
+        self.spin_rad.valueChanged.connect(lambda v: self.final_preview.update_selected_shape(corner_radius=v))
+        self.chk_aspect.toggled.connect(lambda v: self.final_preview.update_selected_shape(lock_aspect=v))
+        self.btn_reset_transform.clicked.connect(self.final_preview.reset_selected_transform)
+        self.btn_delete_shape.clicked.connect(self.final_preview.delete_selected_shape)
 
         brush_row = QHBoxLayout()
         brush_lab = QLabel("Brush")
@@ -368,6 +451,7 @@ class MainWindow(QMainWindow):
         self.btn_camera.clicked.connect(self._on_apply_camera_mask)
         layout.addWidget(self.btn_camera)
         return box
+
 
     def _adjust_group(self) -> QGroupBox:
         box = QGroupBox("Cover adjustments")
@@ -715,6 +799,68 @@ class MainWindow(QMainWindow):
         label = dict(DEBUG_VIEWS).get(key, key)
         self._set_status(f"Debug view: {label}")
 
+    def _on_tool(self, tool: str) -> None:
+        if self.final_preview.tool() == tool:
+            self.final_preview.set_tool(None)
+            self._tool_group.setExclusive(False)
+            if tool in self._tool_buttons:
+                self._tool_buttons[tool].setChecked(False)
+            self._tool_group.setExclusive(True)
+            self._exit_mask_edit()
+            self._refresh_previews(keep_mask=True)
+            self._set_status("Camera editing closed.")
+            return
+
+        self._enter_mask_edit()
+        self.final_preview.set_tool(tool)
+        if tool in self._tool_buttons:
+            self._tool_buttons[tool].setChecked(True)
+        if tool == "move":
+            self._set_status("Select/Move: Drag shapes, resize handles, or rotate top handle. Delete key removes shape.")
+        elif tool in ("rect", "roundrect", "circle", "ellipse", "pill"):
+            self._set_status(f"{tool.capitalize()}: Drag on the camera area to create a shape.")
+        elif tool == "polygon":
+            self._set_status("Polygon: Click to add vertices. Double-click or Enter to finish.")
+        elif tool == "freeform":
+            self._set_status("Freeform: Drag to draw custom outline.")
+        elif tool == "brush":
+            self._set_status("Brush: Paint mask area.")
+        elif tool == "eraser":
+            self._set_status("Eraser: Erase mask area.")
+
+    def _on_brush(self, value: int) -> None:
+        self.final_preview.brush_radius = float(value)
+
+    def _on_shape_selected(self, shape_dict: dict | None) -> None:
+        if shape_dict is None:
+            self._shape_prop_group.setEnabled(False)
+            return
+        self._shape_prop_group.setEnabled(True)
+        self._sync_shape_properties(shape_dict)
+
+    def _on_shape_updated(self, shape_dict: dict | None) -> None:
+        if shape_dict is not None:
+            self._sync_shape_properties(shape_dict)
+
+    def _sync_shape_properties(self, d: dict) -> None:
+        widgets = (self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.spin_rot, self.spin_rad, self.chk_aspect)
+        for w in widgets:
+            w.blockSignals(True)
+
+        self.spin_x.setValue(int(round(d.get("x", 0))))
+        self.spin_y.setValue(int(round(d.get("y", 0))))
+        self.spin_w.setValue(int(round(d.get("width", 10))))
+        self.spin_h.setValue(int(round(d.get("height", 10))))
+        self.spin_rot.setValue(float(d.get("rotation", 0.0)))
+        self.spin_rad.setValue(int(round(d.get("corner_radius", 0))))
+        self.chk_aspect.setChecked(bool(d.get("lock_aspect", False)))
+
+        st = d.get("shape_type", "")
+        self.spin_rad.setEnabled(st in ("roundrect", "rect", "pill"))
+
+        for w in widgets:
+            w.blockSignals(False)
+
     def _enter_mask_edit(self) -> None:
         if self.processor.cover is None:
             return
@@ -724,6 +870,7 @@ class MainWindow(QMainWindow):
                 self.final_preview.set_camera_mask(self.processor.masks.camera_exclusion)
         self._mask_edit = True
         self._show_bare_cover()
+
 
     def _show_bare_cover(self) -> None:
         bare = self.processor.preview_bare_cover()
@@ -874,6 +1021,48 @@ class MainWindow(QMainWindow):
                 background: #3d9cf0;
                 border-radius: 6px;
             }
+            QGroupBox#subGroup {
+                background: #181d24;
+                border: 1px solid #2a3340;
+                border-radius: 6px;
+                margin-top: 8px;
+                padding: 6px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #8fb8ff;
+            }
+            QGroupBox#subGroup::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+            }
+            QSpinBox, QDoubleSpinBox {
+                background: #1e242d;
+                color: #e8eaed;
+                border: 1px solid #343f50;
+                border-radius: 4px;
+                padding: 2px 4px;
+                font-size: 11px;
+            }
+            QSpinBox:focus, QDoubleSpinBox:focus {
+                border-color: #00d2ff;
+            }
+            QCheckBox {
+                color: #c4c9d4;
+                font-size: 11px;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #3a475a;
+                border-radius: 3px;
+                background: #1e242d;
+            }
+            QCheckBox::indicator:checked {
+                background: #2f7de1;
+                border-color: #00d2ff;
+            }
             QStatusBar {
                 background: #101317;
                 color: #9aa3b2;
@@ -884,3 +1073,4 @@ class MainWindow(QMainWindow):
             QScrollArea { background: transparent; }
             """
         )
+

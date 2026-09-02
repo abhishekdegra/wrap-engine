@@ -207,12 +207,23 @@ class CoverProcessor:
     def _composite(self, *, preview: bool) -> np.ndarray:
         assert self.cover is not None and self.masks is not None
         cover, fitted, print_mask = self.cover, self._fitted, self.masks.final_print
+        cam_mask = self.masks.camera_exclusion
         if fitted is None:
             fitted = np.zeros_like(cover)
         if preview:
             cover, fitted, print_mask = _downscale_stack(cover, fitted, print_mask)
+            # Downscale camera mask to match preview size.
+            if cam_mask is not None and cam_mask.size > 0:
+                cam_mask = cv2.resize(
+                    cam_mask.astype(np.float32),
+                    (cover.shape[1], cover.shape[0]),
+                    interpolation=cv2.INTER_AREA,
+                )
         looked = apply_cover_look(cover, self.look)
-        return composite_design_under_cover(looked, fitted, print_mask, cover_overlay=0.0)
+        return composite_design_under_cover(
+            looked, fitted, print_mask, cover_overlay=0.0,
+            camera_exclusion_mask=cam_mask,
+        )
 
 
 def _downscale_stack(

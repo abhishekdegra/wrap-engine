@@ -18,11 +18,16 @@ def composite_design_under_cover(
     print_mask: np.ndarray,
     cover_overlay: float = COVER_OVERLAY_STRENGTH,
     surface_lighting: float = SURFACE_LIGHTING_STRENGTH,
+    camera_exclusion_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Lerp cover → design using the antialiased print mask only.
 
     Applies realistic surface lighting (reflections/highlights from cover material)
     via soft-light blending when ``surface_lighting`` > 0.
+
+    When ``camera_exclusion_mask`` is provided, adds a subtle darkening band
+    along the camera rim edge to simulate the physical shadow where the
+    printed skin wraps around the rim.
     """
     cover = cover_rgba.astype(np.float32) / 255.0
     design = design_canvas_rgba.astype(np.float32) / 255.0
@@ -47,6 +52,16 @@ def composite_design_under_cover(
         else:
             light_map = np.full_like(cover_lum, 0.5)
         design_rgb = _apply_soft_light(design_rgb, light_map, lighting_str)
+
+        # Subtle rim shadow along the artwork edge wrapping around the camera island.
+        if camera_exclusion_mask is not None:
+            cam_m = _as_float_mask(camera_exclusion_mask)
+            if cam_m.max() > 0.01:
+                import cv2
+                cam_blur = cv2.GaussianBlur(cam_m, (0, 0), sigmaX=2.5)
+                rim_shadow = np.clip(cam_blur * mask, 0.0, 1.0)
+                darken = 1.0 - rim_shadow * lighting_str * 0.35
+                design_rgb = design_rgb * darken[..., None]
 
     overlay = float(np.clip(cover_overlay, 0.0, 1.0))
     if overlay > 0.0:

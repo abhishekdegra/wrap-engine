@@ -62,6 +62,7 @@ def masks_from_binaries(
     back_bin: np.ndarray,
     camera_bin: np.ndarray,
     feather_px: float,
+    camera_contour: np.ndarray | None = None,
 ) -> MaskSet:
     """Antialiased masks from detected silhouettes — perspective-aware and uniform rim."""
     feather = float(feather_px)
@@ -93,10 +94,15 @@ def masks_from_binaries(
             back_m = silhouette_to_aa_mask(back_src, feather)
             back_m = np.minimum(back_m, outer_m)
 
-    camera_m = _camera_aa_mask(camera_bin, feather)
+    # Use contour-based high-quality AA when a refined polyline is available.
+    if camera_contour is not None and camera_contour.shape[0] >= 12:
+        camera_m = _camera_contour_aa_mask(camera_contour, camera_bin, feather)
+    else:
+        camera_m = _camera_aa_mask(camera_bin, feather)
     back_m = np.minimum(back_m, outer_m)
     camera_m = np.minimum(camera_m, outer_m)
     edge_m = np.clip(outer_m - back_m, 0.0, 1.0)
+    # Clean antialiased camera cutout: artwork stops cleanly right at the detected outer rim.
     final_print = np.clip(back_m * (1.0 - camera_m), 0.0, 1.0).astype(np.float32)
     final_print[final_print < 0.02] = 0.0
     return MaskSet(
@@ -143,6 +149,58 @@ def _camera_aa_mask(camera_bin: np.ndarray, feather: float) -> np.ndarray:
     if aspect <= 2.05 and extent >= 0.52:
         return _island_aa_mask(camera_bin, feather)
     return binary_to_antialiased(camera_bin, feather)
+
+
+def _camera_contour_aa_mask(
+    contour: np.ndarray,
+    camera_bin: np.ndarray,
+    feather: float,
+) -> np.ndarray:
+    """High-quality AA camera mask from a refined contour polyline.
+
+    Rasterizes the refined contour at supersampled resolution with exact
+    SDF antialiasing and BOX downsampling, giving the camera rim crisp,
+    sub-pixel antialiasing with zero bleed into the camera area.
+    """
+    from PIL import Image
+
+    if camera_bin is None or not np.any(camera_bin):
+        shape = camera_bin.shape[:2] if camera_bin is not None else (0, 0)
+        return np.zeros(shape, dtype=np.float32)
+
+    finished = fill_binary_holes(camera_bin.astype(bool))
+    height, width = finished.shape
+    scale = _aa_scale(height, width)
+    hi_w, hi_h = width * scale, height * scale
+
+    orig_hi = cv2.resize(
+        finished.astype(np.float32),
+        (hi_w, hi_h),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    orig_bin = (orig_hi >= 0.45).astype(np.uint8)
+    cap = cv2.dilate(orig_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    floor = cv2.erode(orig_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    canvas = orig_bin.copy()
+
+    if contour is not None and contour.shape[0] >= 12:
+        pts = _smooth_closed_polyline(contour, sigma_frac=0.0025)
+        peri = float(np.linalg.norm(np.diff(np.vstack([pts, pts[0]]), axis=0), axis=1).sum())
+        npts = max(len(pts), int(peri * scale * 1.25), 64)
+        pts = _resample_closed_polyline(pts, npts)
+        poly = np.round(pts * scale).astype(np.int32).reshape(-1, 1, 2)
+        smooth_hi = np.zeros((hi_h, hi_w), dtype=np.uint8)
+        cv2.fillPoly(smooth_hi, [poly], 1, lineType=cv2.LINE_AA)
+        canvas = np.maximum(floor, np.minimum(smooth_hi, cap))
+
+    dist_in = cv2.distanceTransform(canvas, cv2.DIST_L2, 5)
+    dist_out = cv2.distanceTransform(1 - canvas, cv2.DIST_L2, 5)
+    sdf = np.where(canvas > 0, -dist_in, dist_out).astype(np.float32)
+    coverage = coverage_from_sdf(sdf, max(float(feather), 0.75) * scale)
+
+    cov_u8 = np.clip(coverage * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    down = Image.fromarray(cov_u8, mode="L").resize((width, height), Image.Resampling.BOX)
+    return (np.asarray(down).astype(np.float32) / 255.0)
 
 
 def refine_outer_binary(binary: np.ndarray) -> np.ndarray:
@@ -432,7 +490,13 @@ def _fit_perspective_phone_quad(pts: np.ndarray | None) -> np.ndarray | None:
     v_br = line_intersection(p_bot, d_bot, p_right, d_right)
     v_bl = line_intersection(p_bot, d_bot, p_left, d_left)
 
-    return np.array([v_tl, v_tr, v_br, v_bl], dtype=np.float64)
+    raw_quad = np.array([v_tl, v_tr, v_br, v_bl], dtype=np.float64)
+    ysort = raw_quad[np.argsort(raw_quad[:, 1])]
+    top_two = ysort[:2]
+    bot_two = ysort[2:]
+    tl, tr = top_two[np.argsort(top_two[:, 0])]
+    bl, br = bot_two[np.argsort(bot_two[:, 0])]
+    return np.array([tl, tr, br, bl], dtype=np.float64)
 
 
 def inset_quad(quad: np.ndarray, inset_px: float) -> np.ndarray:
