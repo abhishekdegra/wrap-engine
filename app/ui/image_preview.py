@@ -1255,6 +1255,8 @@ class ImagePreview(QWidget):
         stroke = _rasterize_shape(h, w, draw, 3)
         if self._raster_mask is None:
             self._raster_mask = np.zeros((h, w), dtype=np.float32)
+        elif self._raster_mask.shape != (h, w):
+            self._raster_mask = cv2.resize(self._raster_mask, (w, h), interpolation=cv2.INTER_LINEAR)
 
         if self._tool == "eraser":
             self._raster_mask = np.clip(self._raster_mask * (1.0 - stroke), 0.0, 1.0)
@@ -1271,12 +1273,12 @@ class ImagePreview(QWidget):
 
     def _rasterize_full_mask(self) -> np.ndarray:
         w, h = self._canvas_size()
-        ss = 4
-        img = QImage(w * ss, h * ss, QImage.Format.Format_ARGB32_Premultiplied)
+        if w < 1 or h < 1:
+            return np.zeros((1, 1), dtype=np.float32)
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(0)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.scale(ss, ss)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(255, 255, 255))
 
@@ -1297,8 +1299,7 @@ class ImagePreview(QWidget):
                 rad = min(s.width, s.height) / 2.0
                 path = QPainterPath()
                 path.addRoundedRect(rect, rad, rad)
-                painter_draw = path
-                p.drawPath(painter_draw)
+                p.drawPath(path)
             elif s.shape_type == "roundrect":
                 rad = min(s.corner_radius, min(s.width, s.height) / 2.0)
                 path = QPainterPath()
@@ -1316,11 +1317,12 @@ class ImagePreview(QWidget):
 
         p.end()
         ptr = img.constBits()
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h * ss, w * ss, 4).copy()
-        alpha = arr[..., 3].astype(np.float32) / 255.0
-        mask = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        mask = (arr[..., 3].astype(np.float32) / 255.0).copy()
 
         if self._raster_mask is not None:
+            if self._raster_mask.shape != (h, w):
+                self._raster_mask = cv2.resize(self._raster_mask, (w, h), interpolation=cv2.INTER_LINEAR)
             mask = np.clip(mask + self._raster_mask, 0.0, 1.0)
 
         return mask
@@ -1329,16 +1331,18 @@ class ImagePreview(QWidget):
         if self._pixmap.isNull():
             self._overlay = QPixmap()
             return
-        w, h = self._canvas_size()
-        full_mask = self._rasterize_full_mask()
-        self._mask = full_mask
-
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[..., 0] = 40
-        rgba[..., 1] = 170
-        rgba[..., 2] = 255
-        rgba[..., 3] = np.clip(full_mask * 120.0, 0, 255).astype(np.uint8)
-        self._overlay = QPixmap.fromImage(numpy_rgba_to_qimage(rgba))
+        if self._raster_mask is not None and np.any(self._raster_mask > 0.01):
+            w, h = self._canvas_size()
+            if self._raster_mask.shape != (h, w):
+                self._raster_mask = cv2.resize(self._raster_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[..., 0] = 40
+            rgba[..., 1] = 170
+            rgba[..., 2] = 255
+            rgba[..., 3] = np.clip(self._raster_mask * 120.0, 0, 255).astype(np.uint8)
+            self._overlay = QPixmap.fromImage(numpy_rgba_to_qimage(rgba))
+        else:
+            self._overlay = QPixmap()
 
     def _emit_shape_selected(self) -> None:
         shape = self.selected_shape()

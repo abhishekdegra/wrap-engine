@@ -651,7 +651,7 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(False)
         self._set_status("Processing…")
 
-        thread = QThread(self)
+        thread = QThread()
         worker = CoverWorker(self.processor, path)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -673,7 +673,7 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(False)
         self._set_status("Processing…")
 
-        thread = QThread(self)
+        thread = QThread()
         worker = DesignWorker(self.processor, path)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

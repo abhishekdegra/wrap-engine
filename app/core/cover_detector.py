@@ -266,8 +266,12 @@ def _pack_detection(
     camera_outer_rim: np.ndarray | None = None,
 ) -> CoverDetection:
     masks = masks_from_binaries(
-        outer_filled, back_full, camera, MASK_FEATHER_PX,
+        outer_filled,
+        back_full,
+        camera,
+        MASK_FEATHER_PX,
         camera_contour=camera_contour,
+        cover_rgba=cover_rgba,
     )
     confidence, warnings = _score(
         cover_rgba, outer_filled, back_full, camera_found, has_alpha
@@ -275,8 +279,20 @@ def _pack_detection(
     warnings.extend(extra_warnings)
     raw = raw_outer if raw_outer is not None else outer_filled
 
+    final_clipping_bin = masks.printable_back > 0.5
+    
+    # Validation Debug Image (as requested: Red=outer, Green=inner, Blue=final mask)
+    rim_validation = cover_rgba.copy()
+    rim_validation[..., :3] = contour_overlay(rim_validation, outer_filled, (0, 0, 255))[..., :3]     # RED (BGR format)
+    rim_validation[..., :3] = contour_overlay(rim_validation, back_full, (0, 255, 0))[..., :3]        # GREEN
+    rim_validation[..., :3] = contour_overlay(rim_validation, final_clipping_bin, (255, 0, 0))[..., :3] # BLUE
+
     debug = {
         "uploaded_cover": cover_rgba,
+        "rim_validation": rim_validation,
+        "outer_physical_rim": contour_overlay(cover_rgba, outer_filled, (40, 200, 90)),
+        "inner_rim_contact_contour": contour_overlay(cover_rgba, back_full, (80, 180, 255)),
+        "final_artwork_clipping_contour": contour_overlay(cover_rgba, final_clipping_bin, (255, 120, 40)),
         "raw_contour": contour_overlay(cover_rgba, raw, (255, 90, 70)),
         "cleaned_contour": contour_overlay(cover_rgba, outer_filled, (40, 200, 90)),
         "printable_boundary": contour_overlay(cover_rgba, back_full, (80, 180, 255)),
@@ -1004,6 +1020,8 @@ def _inner_printable_panel(
     outer_top = int(ys_out.min()) if ys_out.size else 0
     outer_bot = int(ys_out.max()) if ys_out.size else 0
 
+    bumper = _side_wall_width(cover_rgba, outer, has_alpha, min_side)
+    dist_outer = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
     for candidate in (
         _inner_from_visible_lip(rgb, outer, min_side),
         _inner_from_nested_edges(rgb, outer, min_side),
@@ -1017,12 +1035,17 @@ def _inner_printable_panel(
             if ys_in.size:
                 top_gap = ys_in.min() - outer_top
                 bot_gap = outer_bot - ys_in.max()
-                # If bottom gap is significantly larger than top gap, an internal charging port / speaker hole was picked
                 if bot_gap > max(8.0, top_gap * 2.2):
+                    continue
+            u8 = panel.astype(np.uint8)
+            boundary = cv2.dilate(u8, np.ones((3, 3), np.uint8)) & (1 - u8)
+            if boundary.any():
+                mean_d = float(np.mean(dist_outer[boundary.astype(bool)]))
+                # Nested inner-glass / artwork rect sits far inside the real bumper lip.
+                if mean_d > float(bumper) * 1.25 + 1.5:
                     continue
             return panel
 
-    bumper = _side_wall_width(cover_rgba, outer, has_alpha, min_side)
     ceiling = float(SIDE_WALL_MAX_FRACTION) * min_side
     floor = _bumper_floor_px(min_side)
     bumper = float(np.clip(bumper, floor, ceiling))
@@ -1413,11 +1436,20 @@ def _side_wall_width(
     deriv[0] = 0.0
     if deriv.size < 4:
         return fallback
-    peak_i = int(np.argmax(deriv[1:]) + 1)
-    peak = float(deriv[peak_i])
     noise = float(np.median(deriv[deriv > 0])) if (deriv > 0).any() else 0.0
+    thresh = max(4.0, 1.65 * noise)
+    peak_i = None
+    # First strong peak walking inward from the outer rim = inner bumper lip,
+    # not a deeper inner-glass / rounded-rect edge.
+    for i in range(2, deriv.size - 1):
+        if deriv[i] >= thresh and deriv[i] >= deriv[i - 1] and deriv[i] >= deriv[i + 1]:
+            peak_i = int(i)
+            break
+    if peak_i is None:
+        peak_i = int(np.argmax(deriv[1:]) + 1)
+    peak = float(deriv[peak_i])
     # Real bumper lip: a sharp change a few pixels in from the outer edge.
-    if peak > max(4.0, 1.65 * noise) and 2 <= peak_i <= max_t - 1:
+    if peak > thresh and 2 <= peak_i <= max_t - 1:
         return float(np.clip(float(peak_i), floor, ceiling))
     return float(np.clip(fallback, floor, ceiling))
 
