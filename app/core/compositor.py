@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from app.core.camera_rim_shading import apply_3d_camera_rim_shading
 from app.utils.constants import COVER_OVERLAY_STRENGTH, SURFACE_LIGHTING_STRENGTH
 
 
@@ -53,16 +54,6 @@ def composite_design_under_cover(
             light_map = np.full_like(cover_lum, 0.5)
         design_rgb = _apply_soft_light(design_rgb, light_map, lighting_str)
 
-        # Subtle rim shadow along the artwork edge wrapping around the camera island.
-        if camera_exclusion_mask is not None:
-            cam_m = _as_float_mask(camera_exclusion_mask)
-            if cam_m.max() > 0.01:
-                import cv2
-                cam_blur = cv2.GaussianBlur(cam_m, (0, 0), sigmaX=2.5)
-                rim_shadow = np.clip(cam_blur * mask, 0.0, 1.0)
-                darken = 1.0 - rim_shadow * lighting_str * 0.35
-                design_rgb = design_rgb * darken[..., None]
-
     overlay = float(np.clip(cover_overlay, 0.0, 1.0))
     if overlay > 0.0:
         mix = overlay * mask
@@ -73,6 +64,18 @@ def composite_design_under_cover(
 
     out_rgb = design_rgb * art_w[..., None] + cover_rgb * keep[..., None]
     out_a = np.clip(art_w + cover_a * keep, 0.0, 1.0)
+
+    # Physical 3D camera-rim realism: restore original rim highlights, specular reflections,
+    # and groove shadows across the wrapped artwork strictly within the camera rim band.
+    if camera_exclusion_mask is not None:
+        out_rgb = apply_3d_camera_rim_shading(
+            cover_rgb,
+            out_rgb,
+            mask,
+            camera_exclusion_mask,
+            artwork_weight=art_w,
+            strength=1.0,
+        )
 
     out = np.concatenate([out_rgb, out_a[..., None]], axis=2)
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
