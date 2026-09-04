@@ -126,6 +126,19 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
             "Camera detection was uncertain, so it was not applied. "
             "Use “Mark camera area” if the cutout is missing."
         ]
+
+    # If an isolated camera wasn't detected inside the plate, check if the printable panel
+    # already has the camera island excluded along the upper perimeter/corners (e.g. OPPO, OnePlus, bumper cases).
+    if not camera_found:
+        box = _bbox(back_full)
+        if box is not None and box[2] >= 10 and box[3] >= 10:
+            bx, by, bw, bh = box
+            top_h = int(0.35 * bh)
+            tl_box = back_full[by : by + top_h, bx : bx + int(0.45 * bw)]
+            tr_box = back_full[by : by + top_h, bx + int(0.55 * bw) : bx + bw]
+            if float(tl_box.mean()) < 0.40 or float(tr_box.mean()) < 0.40:
+                camera_found = True
+                cam_warnings = []
     quad = back_panel_quad(back_full)
     print_margin = max(PRINT_MARGIN_MIN_PX, PRINT_MARGIN_FRACTION * min_side)
     print_body = back_full
@@ -280,26 +293,44 @@ def _pack_detection(
     raw = raw_outer if raw_outer is not None else outer_filled
 
     final_clipping_bin = masks.printable_back > 0.5
+    rim_bin = outer_filled & ~back_full
     
-    # Validation Debug Image (as requested: Red=outer, Green=inner, Blue=final mask)
+    # Validation Debug Image (Red=outer, Amber=rim, Green=inner printable, Yellow=camera, Blue=final mask)
     rim_validation = cover_rgba.copy()
+    if np.any(rim_bin):
+        rgb_val = rim_validation[..., :3].astype(np.float32)
+        rgb_val[rim_bin] = rgb_val[rim_bin] * 0.45 + np.array([0, 165, 255], dtype=np.float32) * 0.55
+        rim_validation[..., :3] = np.clip(rgb_val, 0, 255).astype(np.uint8)
     rim_validation[..., :3] = contour_overlay(rim_validation, outer_filled, (0, 0, 255))[..., :3]     # RED (BGR format)
     rim_validation[..., :3] = contour_overlay(rim_validation, back_full, (0, 255, 0))[..., :3]        # GREEN
+    rim_validation[..., :3] = contour_overlay(rim_validation, camera, (0, 255, 255))[..., :3]         # YELLOW
     rim_validation[..., :3] = contour_overlay(rim_validation, final_clipping_bin, (255, 0, 0))[..., :3] # BLUE
+
+    rim_preview = cover_rgba.copy()
+    if np.any(rim_bin):
+        rgb_rim = rim_preview[..., :3].astype(np.float32)
+        rgb_rim[rim_bin] = rgb_rim[rim_bin] * 0.40 + np.array([0, 165, 255], dtype=np.float32) * 0.60
+        rim_preview[..., :3] = np.clip(rgb_rim, 0, 255).astype(np.uint8)
+    rim_preview = contour_overlay(rim_preview, outer_filled, (0, 0, 255))
+    rim_preview = contour_overlay(rim_preview, back_full, (0, 255, 0))
 
     debug = {
         "uploaded_cover": cover_rgba,
+        "outer_cover_contour": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
+        "detected_rim": rim_preview,
+        "printable_boundary": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
+        "camera_mask": contour_overlay(cover_rgba, camera, (0, 255, 255)),
+        "final_artwork_mask": mask_to_preview(masks.final_print),
         "rim_validation": rim_validation,
-        "outer_physical_rim": contour_overlay(cover_rgba, outer_filled, (40, 200, 90)),
-        "inner_rim_contact_contour": contour_overlay(cover_rgba, back_full, (80, 180, 255)),
+        "outer_physical_rim": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
+        "inner_rim_contact_contour": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
         "final_artwork_clipping_contour": contour_overlay(cover_rgba, final_clipping_bin, (255, 120, 40)),
         "raw_contour": contour_overlay(cover_rgba, raw, (255, 90, 70)),
-        "cleaned_contour": contour_overlay(cover_rgba, outer_filled, (40, 200, 90)),
-        "printable_boundary": contour_overlay(cover_rgba, back_full, (80, 180, 255)),
+        "cleaned_contour": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
         "final_print_mask": mask_to_preview(masks.final_print),
-        "outer_contour": contour_overlay(cover_rgba, outer_filled, (40, 200, 90)),
-        "back_contour": contour_overlay(cover_rgba, back_full, (80, 180, 255)),
-        "back_panel": contour_overlay(cover_rgba, back_full, (80, 180, 255)),
+        "outer_contour": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
+        "back_contour": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
+        "back_panel": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
         "camera_exclusion": mask_to_preview(masks.camera_exclusion),
         "edge_exclusion": mask_to_preview(masks.edge_exclusion),
     }
@@ -409,9 +440,15 @@ def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
         h, w = back_bin.shape
         return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
+    h, w = back_bin.shape[:2]
     quad = _fit_perspective_phone_quad(_contour_points(back_bin))
     if quad is not None:
-        return quad.astype(np.float32)
+        qx0, qy0 = float(quad[:, 0].min()), float(quad[:, 1].min())
+        qx1, qy1 = float(quad[:, 0].max()), float(quad[:, 1].max())
+        qw, qh = qx1 - qx0, qy1 - qy0
+        if qx0 >= -0.15 * w and qy0 >= -0.15 * h and qx1 <= 1.15 * w and qy1 <= 1.15 * h:
+            if qw >= 0.40 * w and qh >= 0.40 * h:
+                return quad.astype(np.float32)
 
     x0, x1 = float(xs.min()), float(xs.max())
     y0, y1 = float(ys.min()), float(ys.max())
@@ -449,12 +486,37 @@ def _outer_from_alpha(alpha: np.ndarray) -> np.ndarray:
     return closed.astype(bool)
 
 
+def _border_background_segmented_fg(rgb: np.ndarray) -> np.ndarray:
+    """Background floodfill from image perimeter — robust for phone cases on light/dark backgrounds."""
+    height, width = rgb.shape[:2]
+    border = np.concatenate([rgb[0, :], rgb[-1, :], rgb[:, 0], rgb[:, -1]], axis=0).astype(np.float32)
+    bg_med = np.median(border, axis=0)
+    dists = np.linalg.norm(border - bg_med, axis=1)
+    tol = max(14.0, float(np.percentile(dists, 90)) * 1.6 + 4.0)
+
+    diff = np.linalg.norm(rgb.astype(np.float32) - bg_med, axis=2)
+    cand = (diff < tol).astype(np.uint8) * 255
+    mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+    seeds = [
+        (0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1),
+        (width // 2, 0), (width // 2, height - 1), (0, height // 2), (width - 1, height // 2)
+    ]
+    for sx, sy in seeds:
+        if cand[sy, sx] == 255:
+            cv2.floodFill(cand, mask, (sx, sy), 128)
+    bg = (cand == 128)
+    fg = ~bg
+    if float(fg.mean()) < 0.05 or float(fg.mean()) > 0.985:
+        return np.zeros((height, width), dtype=bool)
+    return fg
+
+
 def _outer_from_rgb(rgb: np.ndarray) -> np.ndarray:
     """Full device silhouette vs background — never an inner glass/chroma sticker."""
     height, width = rgb.shape[:2]
-    best: np.ndarray | None = None
-    best_key = -1.0
+    cands = []
     for raw in (
+        _border_background_segmented_fg(rgb),
         _lab_border_fg(rgb),
         _grabcut_border_fg(rgb),
         _flood_fill_fg(rgb),
@@ -464,6 +526,28 @@ def _outer_from_rgb(rgb: np.ndarray) -> np.ndarray:
         if raw is None or not raw.any():
             continue
         filled = _clean_cover_silhouette(raw)
+        ps = _phone_score(filled, height, width)
+        if ps >= 0.20:
+            cands.append(filled)
+
+    # Filter out candidates that are strict inner subsets of another valid phone candidate
+    outer_cands = []
+    for c in cands:
+        c_area = float(c.sum())
+        is_inner_subset = False
+        for other in cands:
+            o_area = float(other.sum())
+            if o_area > 1.12 * c_area:
+                overlap = float((c & other).sum())
+                if overlap >= 0.90 * c_area:
+                    is_inner_subset = True
+                    break
+        if not is_inner_subset:
+            outer_cands.append(c)
+
+    best: np.ndarray | None = None
+    best_key = -1.0
+    for filled in (outer_cands if outer_cands else cands):
         key = _cover_choice_score(filled, height, width)
         if key > best_key:
             best, best_key = filled, key
@@ -479,7 +563,7 @@ def _cover_choice_score(mask: np.ndarray, height: int, width: int) -> float:
         return -1.0
     area = float(mask.mean())
     rough = _contour_roughness(mask)
-    return float(ps + 0.55 * min(area / 0.50, 1.0) - 0.22 * rough)
+    return float(ps + 0.50 * area - 0.22 * rough)
 
 
 def _contour_roughness(mask: np.ndarray) -> float:
@@ -893,8 +977,10 @@ def _clean_cover_silhouette(mask: np.ndarray) -> np.ndarray:
     """Fill holes and join tiny rim gaps without shrinking the panel."""
     if mask is None or not mask.any():
         return np.zeros(mask.shape[:2], dtype=bool) if mask is not None else mask
-    filled = _fill_holes(_largest_component(mask.astype(bool)))
-    h, w = filled.shape
+    pad = 6
+    padded = np.pad(mask.astype(np.uint8), pad, mode="constant", constant_values=0)
+    filled = _fill_holes(_largest_component(padded.astype(bool)))
+    h, w = mask.shape[:2]
     k = max(3, int(round(0.004 * min(h, w))))
     if k % 2 == 0:
         k += 1
@@ -904,7 +990,8 @@ def _clean_cover_silhouette(mask: np.ndarray) -> np.ndarray:
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
     )
-    return _fill_holes(_largest_component(closed.astype(bool)))
+    result = _fill_holes(_largest_component(closed.astype(bool)))
+    return result[pad:-pad, pad:-pad]
 
 
 def _sample_background_lab(lab: np.ndarray) -> tuple[np.ndarray, float]:
@@ -934,7 +1021,7 @@ def _lab_border_fg(rgb: np.ndarray) -> np.ndarray:
     med, thresh = _sample_background_lab(lab)
     dist = np.linalg.norm(lab - med[None, None, :], axis=2)
     fg = dist > thresh
-    if float(fg.mean()) > 0.92 or float(fg.mean()) < 0.05:
+    if float(fg.mean()) > 0.985 or float(fg.mean()) < 0.05:
         return np.zeros((height, width), dtype=bool)
     return fg
 
@@ -1007,21 +1094,106 @@ def _edge_outer_only(rgb: np.ndarray) -> np.ndarray:
     return best.astype(bool)
 
 
+def _inner_from_distinct_rim(
+    cover_rgba: np.ndarray,
+    outer: np.ndarray,
+    min_side: float,
+) -> np.ndarray | None:
+    """Detect high-contrast / colored physical rim (e.g. black rim, colored bumper) and extract inner printable panel."""
+    if not outer.any():
+        return None
+    rgb = cover_rgba[..., :3]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    dist = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
+    ys, xs = np.indices((h, w))
+    dist_frame = np.minimum(np.minimum(xs, w - 1 - xs), np.minimum(ys, h - 1 - ys)).astype(np.float32)
+    dist_eff = np.minimum(dist, dist_frame)
+    max_d = float(min(0.14 * min_side, 50.0))
+    if max_d < 5.0:
+        return None
+
+    band_outer = outer & (dist_eff >= 2.5) & (dist_eff <= max(6.0, 0.035 * min_side))
+    band_inner = outer & (dist_eff >= max_d * 0.75)
+    if not band_outer.any() or not band_inner.any():
+        return None
+
+    outer_lum = float(np.median(gray[band_outer]))
+    inner_lum = float(np.median(gray[band_inner]))
+    diff_lum = abs(outer_lum - inner_lum)
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    outer_lab = np.median(lab[band_outer], axis=0)
+    inner_lab = np.median(lab[band_inner], axis=0)
+    diff_color = float(np.linalg.norm(outer_lab - inner_lab))
+
+    # Distinct physical rim requires significant contrast in luminance or color
+    if diff_lum < 20.0 and diff_color < 20.0:
+        return None
+
+    outer_area = float(np.count_nonzero(outer))
+
+    # Segment rim via contrast threshold
+    if diff_lum >= 20.0:
+        thresh = (outer_lum + inner_lum) / 2.0
+        rim_cand = (gray < thresh) if (outer_lum < inner_lum) else (gray > thresh)
+    else:
+        d_outer = np.linalg.norm(lab - outer_lab, axis=2)
+        d_inner = np.linalg.norm(lab - inner_lab, axis=2)
+        rim_cand = d_outer < d_inner
+
+    rim_cand &= outer
+    perimeter_seed = rim_cand & (dist_eff <= 4.5)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(rim_cand.astype(np.uint8))
+    connected_rim = np.zeros_like(rim_cand)
+    for i in range(1, num):
+        comp_mask = (labels == i)
+        if np.any(comp_mask & perimeter_seed):
+            connected_rim |= comp_mask
+
+    k = max(3, int(round(0.008 * min_side)))
+    if k % 2 == 0:
+        k += 1
+    rim_closed = cv2.morphologyEx(
+        connected_rim.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+    )
+
+    inner = outer & ~(rim_closed > 0)
+    panel = _largest_component(inner)
+    frac = float(np.count_nonzero(panel)) / max(outer_area, 1.0)
+    if 0.50 <= frac <= 0.985 and _phone_score(panel, h, w) >= 0.18:
+        return panel
+
+    return None
+
+
 def _inner_printable_panel(
     cover_rgba: np.ndarray,
     outer: np.ndarray,
     has_alpha: bool,
     min_side: float,
 ) -> np.ndarray:
-    """Inner printable lip from this cover's geometry (nested contour, then measured inset)."""
+    """Inner printable lip from this cover's geometry (distinct rim, nested contour, or measured inset)."""
     rgb = cover_rgba[..., :3]
     outer_area = max(float(np.count_nonzero(outer)), 1.0)
     ys_out, _ = np.where(outer)
     outer_top = int(ys_out.min()) if ys_out.size else 0
     outer_bot = int(ys_out.max()) if ys_out.size else 0
 
-    bumper = _side_wall_width(cover_rgba, outer, has_alpha, min_side)
     dist_outer = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
+
+    # Priority 1: High-contrast or colored distinct physical rim (opaque cases with physical bumper/rim)
+    if not has_alpha:
+        distinct_rim_panel = _inner_from_distinct_rim(cover_rgba, outer, min_side)
+        if distinct_rim_panel is not None and np.any(distinct_rim_panel):
+            frac = float(np.count_nonzero(distinct_rim_panel)) / outer_area
+            if 0.55 <= frac <= 0.985 and _phone_score(distinct_rim_panel, outer.shape[0], outer.shape[1]) >= 0.20:
+                return distinct_rim_panel
+
+    # Priority 2: Nested visible lips & edge loops
+    bumper = _side_wall_width(cover_rgba, outer, has_alpha, min_side)
     for candidate in (
         _inner_from_visible_lip(rgb, outer, min_side),
         _inner_from_nested_edges(rgb, outer, min_side),
@@ -1030,19 +1202,19 @@ def _inner_printable_panel(
             continue
         panel = _fill_holes(candidate.astype(bool) & outer)
         frac = float(np.count_nonzero(panel)) / outer_area
-        if 0.86 <= frac <= 0.985 and _phone_score(panel, outer.shape[0], outer.shape[1]) >= 0.30:
+        if 0.55 <= frac <= 0.985 and _phone_score(panel, outer.shape[0], outer.shape[1]) >= 0.22:
             ys_in, _ = np.where(panel)
             if ys_in.size:
                 top_gap = ys_in.min() - outer_top
                 bot_gap = outer_bot - ys_in.max()
-                if bot_gap > max(8.0, top_gap * 2.2):
+                if bot_gap > max(8.0, top_gap * 2.5):
                     continue
             u8 = panel.astype(np.uint8)
             boundary = cv2.dilate(u8, np.ones((3, 3), np.uint8)) & (1 - u8)
             if boundary.any():
                 mean_d = float(np.mean(dist_outer[boundary.astype(bool)]))
                 # Nested inner-glass / artwork rect sits far inside the real bumper lip.
-                if mean_d > float(bumper) * 1.25 + 1.5:
+                if mean_d > float(bumper) * 1.35 + 2.5:
                     continue
             return panel
 
@@ -1050,7 +1222,7 @@ def _inner_printable_panel(
     floor = _bumper_floor_px(min_side)
     bumper = float(np.clip(bumper, floor, ceiling))
     back, _px = _inset_keeping_large_panel(outer, bumper, min_side)
-    if float(np.count_nonzero(back)) < 0.88 * outer_area:
+    if float(np.count_nonzero(back)) < 0.60 * outer_area:
         back, _px = _inset_keeping_large_panel(outer, max(floor, 0.005 * min_side), min_side)
     return back & outer
 
@@ -1064,7 +1236,7 @@ def _inner_from_nested_edges(rgb: np.ndarray, outer: np.ndarray, min_side: float
     edges = cv2.Canny(blur, 22, 76)
     dist = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
     lo = max(1.0, 0.004 * min_side)
-    hi = max(lo + 2.0, 0.055 * min_side)
+    hi = max(lo + 4.0, 0.12 * min_side)
     band = outer & (dist >= lo) & (dist <= hi)
     work = np.zeros_like(edges)
     work[band] = edges[band]
@@ -1083,13 +1255,13 @@ def _inner_from_nested_edges(rgb: np.ndarray, outer: np.ndarray, min_side: float
     hier = hierarchy[0]
     for i, contour in enumerate(contours):
         area = float(cv2.contourArea(contour))
-        if area < 0.82 * outer_area or area > 0.98 * outer_area:
+        if area < 0.55 * outer_area or area > 0.985 * outer_area:
             continue
         filled = np.zeros(outer.shape, dtype=np.uint8)
         cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
         panel = filled.astype(bool) & outer
         frac = float(np.count_nonzero(panel)) / max(outer_area, 1.0)
-        if frac < 0.82 or frac > 0.98:
+        if frac < 0.55 or frac > 0.985:
             continue
         parent = int(hier[i][3])
         nest = 0.12 if parent >= 0 else 0.0
@@ -1142,7 +1314,7 @@ def _inner_from_visible_lip(rgb: np.ndarray, outer: np.ndarray, min_side: float)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     dist = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
     lo = max(2.0, 0.008 * min_side)
-    hi = max(lo + 2.0, 0.042 * min_side)
+    hi = max(lo + 4.0, 0.10 * min_side)
     band = outer & (dist >= lo) & (dist <= hi)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(blur, 24, 80)
@@ -1160,7 +1332,7 @@ def _inner_from_visible_lip(rgb: np.ndarray, outer: np.ndarray, min_side: float)
     best_score = -1.0
     for contour in contours:
         area = float(cv2.contourArea(contour))
-        if area < 0.80 * outer_area or area > 0.97 * outer_area:
+        if area < 0.55 * outer_area or area > 0.985 * outer_area:
             continue
         peri = cv2.arcLength(contour, True)
         if peri < 16:
@@ -1168,7 +1340,7 @@ def _inner_from_visible_lip(rgb: np.ndarray, outer: np.ndarray, min_side: float)
         filled = np.zeros(outer.shape, dtype=np.uint8)
         cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
         fb = filled.astype(bool) & outer
-        if float(np.count_nonzero(fb)) < 0.80 * outer_area:
+        if float(np.count_nonzero(fb)) < 0.55 * outer_area:
             continue
         # Boundary should sit in the bumper band, not on the outer rim or the center.
         u8 = fb.astype(np.uint8)
@@ -1307,8 +1479,12 @@ def _phone_score(mask: np.ndarray, height: int, width: int) -> float:
     # Internal highlights / MagSafe leftovers are narrow relative to the frame.
     if bw < 0.14 * width or bh < 0.20 * height:
         return 0.04
-    if area_frac < 0.08 or area_frac > 0.94:
-        return 0.06
+    if area_frac < 0.05 or area_frac > 0.985:
+        return 0.04
+    if area_frac > 0.93:
+        rb = _roundness_bonus(mask)
+        if rb < 0.20:
+            return 0.06
 
     aspect = bh / float(bw)
     if aspect < 1.0:
@@ -1337,10 +1513,10 @@ def _phone_score(mask: np.ndarray, height: int, width: int) -> float:
         score += 0.20
     if 0.22 <= area_frac <= 0.72:
         score += 0.18
-    if 0.16 <= area_frac <= 0.82:
+    if 0.16 <= area_frac <= 0.85:
         score += 0.22
-    elif 0.10 <= area_frac <= 0.90:
-        score += 0.10
+    elif 0.10 <= area_frac <= 0.985:
+        score += 0.18
     # MagSafe/lens leftovers are small and round; a full cover is large.
     if area_frac < 0.20 and circularity > 0.72:
         score -= 0.45
@@ -1365,21 +1541,17 @@ def _largest_component(binary: np.ndarray) -> np.ndarray:
 
 
 def _fill_holes(binary: np.ndarray) -> np.ndarray:
-    u8 = (binary.astype(np.uint8)) * 255
+    if binary is None or not np.any(binary):
+        return binary
+    pad = 2
+    u8 = (np.pad(binary.astype(np.uint8), pad, mode="constant", constant_values=0)) * 255
     h, w = u8.shape
     flood = u8.copy()
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    if u8[0, 0] != 0:
-        # Background may not include origin; flood from a dark border pixel.
-        ys, xs = np.where(u8 == 0)
-        if ys.size == 0:
-            return binary.astype(bool)
-        cv2.floodFill(flood, mask, (int(xs[0]), int(ys[0])), 255)
-    else:
-        cv2.floodFill(flood, mask, (0, 0), 255)
+    cv2.floodFill(flood, mask, (0, 0), 255)
     holes = cv2.bitwise_not(flood)
-    filled = u8 | holes
-    return filled > 0
+    filled = (u8 | holes) > 0
+    return filled[pad:-pad, pad:-pad]
 
 
 def _bumper_floor_px(min_side: float) -> float:
@@ -1400,13 +1572,13 @@ def _side_wall_width(
     photo has no clear bumper lip (white-on-white).
     """
     floor = _bumper_floor_px(min_side)
-    ceiling = float(min(SIDE_WALL_MAX_FRACTION, 0.025) * min_side)
+    ceiling = float(min(SIDE_WALL_MAX_FRACTION, 0.12) * min_side)
     fallback = max(floor, 0.0045 * min_side)
     if not outer.any():
         return fallback
 
     dist = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
-    search = min(float(0.048 * min_side), float(dist.max()) * 0.40)
+    search = min(float(0.10 * min_side), float(dist.max()) * 0.40)
     max_t = int(max(5, round(search)))
     if has_alpha:
         signal = cover_rgba[..., 3].astype(np.float32)
@@ -1466,18 +1638,18 @@ def _bbox(binary: np.ndarray) -> tuple[int, int, int, int] | None:
 def _inset_keeping_large_panel(
     outer_filled: np.ndarray, bumper_px: float, min_side: float
 ) -> tuple[np.ndarray, float]:
-    """Erode bumper but never shrink the back panel below ~78% of the outline."""
+    """Erode bumper but never shrink the back panel below ~70% of the outline."""
     outer_mean = float(outer_filled.mean())
     px = float(bumper_px)
     min_px = min(px, _bumper_floor_px(float(min_side)))
     for _ in range(12):
         back = inset_binary(outer_filled, px)
         ratio = float(back.mean()) / max(outer_mean, 1e-6)
-        if ratio >= 0.92 and back.any():
+        if ratio >= 0.70 and back.any():
             return back, px
         if px <= min_px:
             break
-        px = max(min_px, px * 0.65)
+        px = max(min_px, px * 0.75)
     back = inset_binary(outer_filled, min_px)
     return back, min_px
 
@@ -1524,17 +1696,17 @@ def _score(
     ratio = back_frac / max(outer_frac, 1e-6)
 
     score = 0.4
-    if 0.12 <= outer_frac <= 0.92:
+    if 0.12 <= outer_frac <= 0.985:
         score += 0.25
     if 0.70 <= ratio <= 0.995:
         score += 0.25
-    elif 0.55 <= ratio < 0.70:
-        score += 0.1
+    elif 0.50 <= ratio < 0.70:
+        score += 0.20
     if camera_found:
-        score += 0.1
+        score += 0.10
     score = float(np.clip(score, 0.0, 1.0))
 
-    if ratio < 0.55:
+    if ratio < 0.50:
         warnings.append("Inner back panel looks unusually small — inspect DEBUG masks before exporting.")
         score = min(score, 0.5)
     if not camera_found:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -39,53 +39,56 @@ from app.utils.image_utils import CoverError
 
 
 DEBUG_VIEWS = (
-    ("raw_contour", "1. Raw detected contour"),
-    ("cleaned_contour", "2. Cleaned contour"),
-    ("printable_boundary", "3. Final printable boundary"),
-    ("final_print_mask", "4. Final mask"),
-    ("camera_exclusion", "5. Camera exclusion"),
-    ("camera_rim_debug", "6. Camera Rim Debug (Red=Outer Rim, Green=Cutout, Cyan=Printable Rim, Blue=Optics)"),
-    ("camera_rim_contour", "7. Camera Rim Contour Overlay"),
-    ("camera_openings", "8. Internal Lenses / Flash"),
-    ("final_composite", "9. Final composite"),
-    ("edge_exclusion", "10. Side wall / edge"),
-    ("artwork_before_mask", "11. Artwork before mask"),
+    ("rim_validation", "1. Rim & Boundary Validation Multi-Overlay"),
+    ("outer_cover_contour", "2. Outer Cover Contour (Red)"),
+    ("detected_rim", "3. Detected Physical Rim (Amber)"),
+    ("printable_boundary", "4. Final Printable Boundary (Green)"),
+    ("camera_mask", "5. Camera Mask (Cyan/Yellow)"),
+    ("final_artwork_mask", "6. Final Artwork Mask"),
+    ("raw_contour", "7. Raw detected contour"),
+    ("cleaned_contour", "8. Cleaned contour"),
+    ("camera_rim_debug", "9. Camera Rim Debug"),
+    ("camera_rim_contour", "10. Camera Rim Contour Overlay"),
+    ("camera_openings", "11. Internal Lenses / Flash"),
+    ("final_composite", "12. Final composite"),
+    ("edge_exclusion", "13. Side wall / edge"),
+    ("artwork_before_mask", "14. Artwork before mask"),
 )
 
 
 
-class CoverWorker(QObject):
-    finished = Signal(object)
+class CoverThread(QThread):
+    finished_detection = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, processor: CoverProcessor, cover_path: str) -> None:
-        super().__init__()
+    def __init__(self, processor: CoverProcessor, cover_path: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
         self._processor = processor
         self._cover_path = cover_path
 
     def run(self) -> None:
         try:
             detection = self._processor.load_cover(self._cover_path)
-            self.finished.emit(detection)
+            self.finished_detection.emit(detection)
         except CoverError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"Something went wrong while reading the cover.\n{exc}")
 
 
-class DesignWorker(QObject):
-    finished = Signal(object)
+class DesignThread(QThread):
+    finished_result = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, processor: CoverProcessor, design_path: str) -> None:
-        super().__init__()
+    def __init__(self, processor: CoverProcessor, design_path: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
         self._processor = processor
         self._design_path = design_path
 
     def run(self) -> None:
         try:
             result = self._processor.process_design(self._design_path)
-            self.finished.emit(result)
+            self.finished_result.emit(result)
         except CoverError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -149,35 +152,39 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter, 1)
         root_layout.addWidget(self._build_thumbs())
 
-        if DEBUG_MODE:
-            header = QLabel("DEBUG MODE — click a view to inspect it in the final preview")
-            header.setObjectName("debugHeader")
-            wrap = QWidget()
-            wrap_layout = QVBoxLayout(wrap)
-            wrap_layout.setContentsMargins(0, 0, 0, 0)
-            wrap_layout.setSpacing(6)
-            wrap_layout.addWidget(header)
+        header = QLabel("DEBUG MODE (Press F12 to toggle) — click a view to inspect it in the final preview")
+        header.setObjectName("debugHeader")
+        self._debug_wrap = QWidget()
+        wrap_layout = QVBoxLayout(self._debug_wrap)
+        wrap_layout.setContentsMargins(0, 0, 0, 0)
+        wrap_layout.setSpacing(6)
+        wrap_layout.addWidget(header)
 
-            thumbs_host = QWidget()
-            thumbs = QHBoxLayout(thumbs_host)
-            thumbs.setContentsMargins(0, 0, 0, 0)
-            thumbs.setSpacing(8)
-            self._debug_thumbs: dict[str, DebugThumb] = {}
-            for key, caption in DEBUG_VIEWS:
-                thumb = DebugThumb(key, caption)
-                thumb.clicked.connect(self._on_debug_clicked)
-                self._debug_thumbs[key] = thumb
-                thumbs.addWidget(thumb)
+        thumbs_host = QWidget()
+        thumbs = QHBoxLayout(thumbs_host)
+        thumbs.setContentsMargins(0, 0, 0, 0)
+        thumbs.setSpacing(8)
+        self._debug_thumbs: dict[str, DebugThumb] = {}
+        for key, caption in DEBUG_VIEWS:
+            thumb = DebugThumb(key, caption)
+            thumb.clicked.connect(self._on_debug_clicked)
+            self._debug_thumbs[key] = thumb
+            thumbs.addWidget(thumb)
 
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            scroll.setWidget(thumbs_host)
-            scroll.setMinimumHeight(168)
-            wrap_layout.addWidget(scroll)
-            root_layout.addWidget(wrap)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(thumbs_host)
+        scroll.setMinimumHeight(168)
+        wrap_layout.addWidget(scroll)
+        root_layout.addWidget(self._debug_wrap)
+
+        self._debug_active = bool(DEBUG_MODE)
+        self._debug_wrap.setVisible(self._debug_active)
+        self._f12_shortcut = QShortcut(QKeySequence("F12"), self)
+        self._f12_shortcut.activated.connect(self._toggle_debug_mode)
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
@@ -539,6 +546,8 @@ class MainWindow(QMainWindow):
         if self.processor.cover is None:
             return
         self.processor.set_look(self._look_from_sliders())
+        if self.processor.last_result is not None:
+            self._result = self.processor.last_result
         if self._mask_edit:
             self._show_bare_cover()
         else:
@@ -555,6 +564,8 @@ class MainWindow(QMainWindow):
             if label is not None:
                 label.setText(str(default))
         self.processor.set_look(CoverLook())
+        if self.processor.last_result is not None:
+            self._result = self.processor.last_result
         if self.processor.cover is not None:
             self._refresh_previews(keep_mask=True)
 
@@ -651,19 +662,12 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(False)
         self._set_status("Processing…")
 
-        thread = QThread()
-        worker = CoverWorker(self.processor, path)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(lambda detection, j=job: self._on_cover_loaded(detection, j))
-        worker.failed.connect(lambda message, j=job: self._on_process_failed(message, j))
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        thread = CoverThread(self.processor, path, self)
+        thread.finished_detection.connect(lambda detection, j=job: self._on_cover_loaded(detection, j))
+        thread.failed.connect(lambda message, j=job: self._on_process_failed(message, j))
         thread.finished.connect(lambda j=job: self._clear_worker(j))
         self._worker_thread = thread
-        self._worker = worker
+        self._worker = thread
         thread.start()
 
     def _start_design_process(self, path: str) -> None:
@@ -673,19 +677,12 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(False)
         self._set_status("Processing…")
 
-        thread = QThread()
-        worker = DesignWorker(self.processor, path)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(lambda result, j=job: self._on_process_finished(result, j))
-        worker.failed.connect(lambda message, j=job: self._on_process_failed(message, j))
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        thread = DesignThread(self.processor, path, self)
+        thread.finished_result.connect(lambda result, j=job: self._on_process_finished(result, j))
+        thread.failed.connect(lambda message, j=job: self._on_process_failed(message, j))
         thread.finished.connect(lambda j=job: self._clear_worker(j))
         self._worker_thread = thread
-        self._worker = worker
+        self._worker = thread
         thread.start()
 
     def _clear_worker(self, job: int | None = None) -> None:
@@ -901,9 +898,16 @@ class MainWindow(QMainWindow):
                 self.final_preview.set_image(debug.get(self._final_key, self._result.composite))
         if not keep_mask and self.processor.masks is not None:
             self.final_preview.set_camera_mask(self.processor.masks.camera_exclusion)
-        if DEBUG_MODE and self._result is not None:
+        if self._debug_active and self._result is not None:
             for key, thumb in self._debug_thumbs.items():
                 thumb.preview.set_image(self._result.debug_images.get(key))
+
+    def _toggle_debug_mode(self) -> None:
+        self._debug_active = not self._debug_active
+        if hasattr(self, "_debug_wrap"):
+            self._debug_wrap.setVisible(self._debug_active)
+            if self._debug_active:
+                self._refresh_previews()
 
     def _set_export_enabled(self, enabled: bool) -> None:
         self.btn_png.setEnabled(enabled)

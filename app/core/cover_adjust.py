@@ -32,11 +32,11 @@ class CoverLook:
         return True
 
 
-def apply_cover_look(cover_rgba: np.ndarray, look: CoverLook) -> np.ndarray:
-    """Return an adjusted copy of the cover. Input array is not modified."""
+def apply_cover_look(cover_layer_rgba: np.ndarray, look: CoverLook) -> np.ndarray:
+    """Return an adjusted copy of the cover/artwork layer. Input array is not modified."""
     if look.is_identity():
-        return cover_rgba
-    img = cover_rgba.astype(np.float32) / 255.0
+        return cover_layer_rgba
+    img = cover_layer_rgba.astype(np.float32) / 255.0
     rgb = np.clip(img[..., :3], 0.0, 1.0)
     alpha = np.clip(img[..., 3], 0.0, 1.0)
 
@@ -71,6 +71,12 @@ def apply_cover_look(cover_rgba: np.ndarray, look: CoverLook) -> np.ndarray:
 
     opacity = float(np.clip(look.opacity, 0.0, 1.0))
     alpha = alpha * opacity
+
+    # Guarantee transparent pixels in the cover/artwork layer remain strictly transparent
+    zero_mask = alpha < 1e-4
+    if np.any(zero_mask):
+        rgb[zero_mask] = 0.0
+        alpha[zero_mask] = 0.0
 
     out = np.concatenate([rgb, alpha[..., None]], axis=2)
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)

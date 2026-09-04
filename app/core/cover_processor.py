@@ -88,6 +88,9 @@ class CoverProcessor:
 
     def set_look(self, look: CoverLook) -> None:
         self.look = look
+        if self.cover is not None and self.masks is not None and self.detection is not None:
+            if self.design is not None and self._fitted is not None:
+                self._refresh_composite()
 
     def set_fit_mode(self, mode: str) -> ProcessingResult | None:
         self.fit_mode = mode.lower()
@@ -156,7 +159,7 @@ class CoverProcessor:
             nw = max(1, int(round(width * scale)))
             nh = max(1, int(round(height * scale)))
             cover = cv2.resize(cover, (nw, nh), interpolation=cv2.INTER_AREA)
-        return apply_cover_look(cover, self.look)
+        return cover
 
     def export(self, fmt: str, destination: str | Path | None = None) -> Path:
         if self.design is None or self._fitted is None or self.last_result is None:
@@ -219,9 +222,11 @@ class CoverProcessor:
                     (cover.shape[1], cover.shape[0]),
                     interpolation=cv2.INTER_AREA,
                 )
-        looked = apply_cover_look(cover, self.look)
+        # Base phone photo must remain pixel-identical (unchanged).
+        # Cover adjustments are isolated exclusively to the artwork/cover layer (fitted).
+        adjusted_cover = apply_cover_look(fitted, self.look)
         return composite_design_under_cover(
-            looked, fitted, print_mask, cover_overlay=0.0,
+            cover, adjusted_cover, print_mask, cover_overlay=0.0,
             camera_exclusion_mask=cam_mask,
         )
 

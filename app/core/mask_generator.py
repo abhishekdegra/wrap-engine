@@ -78,13 +78,18 @@ def masks_from_binaries(
     else:
         outer_m = silhouette_to_aa_mask(outer_src, feather)
 
+    # Adaptive sub-pixel / 1-pixel-scale edge-contact correction
+    contact_px = 1.0
+
     inner_pts = _finish_inner_lip_polyline(_contour_points(back_src))
     if inner_pts is not None and inner_pts.shape[0] >= 16:
         if cover_rgba is not None and outer_pts is not None:
             inner_pts = _trace_continuous_inner_rim(inner_pts, cover_rgba, outer_src, back_src)
         else:
             inner_pts = _snap_polyline_to_boundary(inner_pts, back_src)
-        back_m = _rasterize_wrap_polyline(inner_pts, outer_src.shape, feather, cap_bin=outer_src)
+        back_m = _rasterize_wrap_polyline(
+            inner_pts, outer_src.shape, feather, cap_bin=outer_src, edge_contact_px=contact_px
+        )
     else:
         inset_px = _median_boundary_inset(outer_src, back_src)
         if bumper_px is not None and bumper_px > 0:
@@ -96,7 +101,9 @@ def masks_from_binaries(
                 back_pts = _trace_continuous_inner_rim(back_pts, cover_rgba, outer_src, back_src)
             else:
                 back_pts = _snap_polyline_to_boundary(back_pts, back_src)
-            back_m = _rasterize_wrap_polyline(back_pts, outer_src.shape, feather, cap_bin=outer_src)
+            back_m = _rasterize_wrap_polyline(
+                back_pts, outer_src.shape, feather, cap_bin=outer_src, edge_contact_px=contact_px
+            )
         else:
             back_m = silhouette_to_aa_mask(back_src, feather)
 
@@ -721,7 +728,15 @@ def _trace_continuous_inner_rim(
     mag = np.sqrt(gx**2 + gy**2)
 
     # Correct distance transform: distance from INSIDE the phone to the outer edge/background
-    dist_inside = cv2.distanceTransform(outer_src.astype(np.uint8), cv2.DIST_L2, 5)
+    ys_grid, xs_grid = np.indices((height, width))
+    dist_frame = np.minimum(
+        np.minimum(xs_grid, width - 1 - xs_grid),
+        np.minimum(ys_grid, height - 1 - ys_grid),
+    ).astype(np.float32)
+    dist_inside = np.minimum(
+        cv2.distanceTransform(outer_src.astype(np.uint8), cv2.DIST_L2, 5),
+        dist_frame,
+    )
 
     n = pts.shape[0]
     ys = pts[:, 1]
@@ -830,17 +845,17 @@ def _trace_continuous_inner_rim(
                 thickness_penalty = abs(d_val - calibrated_rim_w) / max(calibrated_rim_w, 1.0)
                 gradient_bonus = g_val / max(max_g, 1.0)
 
-                cost = continuity_penalty + 1.2 * thickness_penalty - 0.7 * gradient_bonus
+                cost = continuity_penalty + 0.35 * thickness_penalty - 1.2 * gradient_bonus
 
                 if cost < best_cost:
                     best_cost = cost
                     best_s = float(s_sub)
 
         # If candidate jumped too far (e.g. button, reflection, gap), enforce continuity
-        if abs(best_s - prev_step) > 2.8:
+        if abs(best_s - prev_step) > 3.0:
             return prev_step
 
-        return 0.70 * prev_step + 0.30 * best_s
+        return 0.50 * prev_step + 0.50 * best_s
 
     # Build cyclic traversal order starting from i_top
     cw_indices = [(i_top + k) % n for k in range(n)]
@@ -1494,6 +1509,7 @@ def _rasterize_wrap_polyline(
     feather: float,
     cap_bin: np.ndarray | None = None,
     cap_slack: float = 1.25,
+    edge_contact_px: float = 0.0,
 ) -> np.ndarray:
     """Fill a finished contour on a supersampled crop, then BOX-downsample."""
     from PIL import Image
@@ -1524,6 +1540,16 @@ def _rasterize_wrap_polyline(
     hi = np.zeros((hi_h, hi_w), dtype=np.uint8)
     cv2.fillPoly(hi, [poly], 255, lineType=cv2.LINE_AA, shift=shift)
 
+    # Adaptive sub-pixel / 1-pixel-scale inward-to-edge contact expansion
+    # Dilates the high-resolution polygon along its detected curve/corner arcs
+    # to eliminate anti-aliasing gaps while strictly preserving the physical rim boundary.
+    if edge_contact_px > 0.0:
+        rad = int(round(float(edge_contact_px) * scale))
+        if rad > 0:
+            k = rad * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            hi = cv2.dilate(hi, kernel)
+
     if cap_bin is not None and np.any(cap_bin):
         outside = (~cap_bin[y0:y1, x0:x1].astype(bool)).astype(np.uint8)
         dist_cap = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
@@ -1534,13 +1560,18 @@ def _rasterize_wrap_polyline(
         )
         hi[dist_hi > (float(cap_slack) * scale)] = 0
 
-    coverage = hi.astype(np.float32) / 255.0
-    # Blur in hi-res pixels so BOX downsample yields ~1px native AA, not a binary edge.
-    sigma = float(np.clip(0.42 * scale, 0.85, 2.15))
-    coverage = cv2.GaussianBlur(coverage, (0, 0), sigmaX=sigma)
+    if edge_contact_px > 0.0:
+        # Exact geometric area anti-aliasing directly via BOX downsampling
+        # avoids eroding the 100% solid artwork core near the inner rim boundary.
+        down = Image.fromarray(hi, mode="L").resize((cw, ch), Image.Resampling.BOX)
+    else:
+        coverage = hi.astype(np.float32) / 255.0
+        # Blur in hi-res pixels so BOX downsample yields ~1px native AA, not a binary edge.
+        sigma = float(np.clip(0.42 * scale, 0.85, 2.15))
+        coverage = cv2.GaussianBlur(coverage, (0, 0), sigmaX=sigma)
+        cov_u8 = np.clip(coverage * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        down = Image.fromarray(cov_u8, mode="L").resize((cw, ch), Image.Resampling.BOX)
 
-    cov_u8 = np.clip(coverage * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    down = Image.fromarray(cov_u8, mode="L").resize((cw, ch), Image.Resampling.BOX)
     crop = np.asarray(down).astype(np.float32) / 255.0
     crop[crop < 0.02] = 0.0
     out = np.zeros((height, width), dtype=np.float32)
@@ -1957,19 +1988,16 @@ def _estimate_corner_radius(filled: np.ndarray, x: int, y: int, bw: int, bh: int
 
 
 def fill_binary_holes(binary: np.ndarray) -> np.ndarray:
-    u8 = (binary.astype(np.uint8)) * 255
-    h, w = u8.shape
-    flood = u8.copy()
-    mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    if u8[0, 0] == 0:
-        cv2.floodFill(flood, mask, (0, 0), 255)
-    else:
-        ys, xs = np.where(u8 == 0)
-        if ys.size == 0:
-            return binary.astype(bool)
-        cv2.floodFill(flood, mask, (int(xs[0]), int(ys[0])), 255)
-    holes = cv2.bitwise_not(flood)
-    return (u8 | holes) > 0
+    if binary is None or not np.any(binary):
+        return binary.astype(bool) if binary is not None else np.zeros((0, 0), bool)
+    h, w = binary.shape[:2]
+    u8 = (binary > 0).astype(np.uint8)
+    padded = np.pad(u8, ((2, 2), (2, 2)), mode="constant", constant_values=0)
+    flood = padded.copy()
+    fmask = np.zeros((h + 6, w + 6), dtype=np.uint8)
+    cv2.floodFill(flood, fmask, (0, 0), 1)
+    holes = (flood == 0)
+    return (padded | holes)[2:-2, 2:-2].astype(bool)
 
 
 def inset_binary(binary: np.ndarray, pixels: float) -> np.ndarray:
