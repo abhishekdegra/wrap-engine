@@ -79,7 +79,7 @@ def detect_camera(
     min_side = float(min(bw, bh))
     back_area = float(np.count_nonzero(back))
     top = np.zeros_like(back)
-    top_h = int(0.55 * bh) if (bh / max(bw, 1) >= 1.4) else bh
+    top_h = int(0.40 * bh)
     top[y0 : y0 + top_h, x0:x1] = back[y0 : y0 + top_h, x0:x1]
 
     lenses, n_lenses, optics_list = _detect_and_cluster_lenses(gray, top, back, min_side, back_area)
@@ -99,15 +99,26 @@ def detect_camera(
     if not _plausible_camera_island(mask, back):
         return _empty
 
-    # Extract or refine the inner camera opening contour directly from the final geometry.
-    if best_contour is not None and best_contour.shape[0] >= 8:
+    # Extract or regularize the inner camera opening contour directly to CAD geometry
+    if best_source in ("rim_trace", "cad_cluster") and best_contour is not None and best_contour.shape[0] >= 8:
         contour = _refine_existing_contour(best_contour, mask, rgb)
     else:
-        contour = _extract_refined_contour(mask, back)
-        if contour is not None:
-            snapped = _snap_contour_to_rim(rgb, contour, mask, back)
-            if snapped is not None:
-                contour = snapped
+        c_ys, c_xs = np.where(mask)
+        if c_ys.size > 0:
+            c_x0, c_x1 = float(c_xs.min()), float(c_xs.max())
+            c_y0, c_y1 = float(c_ys.min()), float(c_ys.max())
+            wb_c = max(1.0, c_x1 - c_x0)
+            hb_c = max(1.0, c_y1 - c_y0)
+            asp = max(wb_c, hb_c) / min(wb_c, hb_c)
+            if hb_c / wb_c > 1.65:
+                r_c = 0.50 * wb_c
+            elif asp < 1.15:
+                r_c = 0.50 * min(wb_c, hb_c)
+            else:
+                r_c = min(32.0, max(8.0, 0.22 * min(wb_c, hb_c)))
+            contour = _build_smooth_rounded_poly(c_x0, c_y0, c_x1, c_y1, radius=r_c, n_pts=256)
+        else:
+            contour = _extract_refined_contour(mask, back)
 
     # Ensure mask strictly matches the refined inner camera opening polyline.
     if contour is not None and contour.shape[0] >= 6:
@@ -124,7 +135,8 @@ def detect_camera(
     if not _plausible_camera_island(mask, back):
         return _empty
 
-    return mask, True, float(best_score), warnings, contour, openings, best_outer_contour
+    out_cnt = best_outer_contour if best_outer_contour is not None else contour
+    return mask, True, float(best_score), warnings, contour, openings, out_cnt
 
 
 
@@ -241,12 +253,9 @@ def _rgb_camera_candidates(
     back_area = float(np.count_nonzero(back))
     min_side = float(min(bw, bh))
 
-    if bh / max(bw, 1) < 1.4:
-        top = back.copy()
-    else:
-        top = np.zeros_like(back)
-        top_h = int(0.58 * bh)
-        top[y0 : y0 + top_h, x0:x1] = back[y0 : y0 + top_h, x0:x1]
+    top = np.zeros_like(back)
+    top_h = int(0.40 * bh)
+    top[y0 : y0 + top_h, x0:x1] = back[y0 : y0 + top_h, x0:x1]
 
     # Pre-process top region with edge-preserving bilateral filter.
     bi = cv2.bilateralFilter(gray, 7, 50, 50)
@@ -261,6 +270,32 @@ def _rgb_camera_candidates(
             conf = 1.0 if n_lenses >= 2 else 0.95
             cands.append((conf, r_mask, r_in_pts, "rim_trace", r_out_pts))
         else:
+            # Regularized CAD bounding geometry around optics cluster
+            ys_l, xs_l = np.where(lenses)
+            c_xmin, c_xmax = float(xs_l.min()), float(xs_l.max())
+            c_ymin, c_ymax = float(ys_l.min()), float(ys_l.max())
+            pad_x = max(10.0, 0.045 * min_side)
+            pad_y = max(10.0, 0.045 * min_side)
+            x_min_c = max(x0 + 2.0, c_xmin - pad_x)
+            x_max_c = min(x1 - 2.0, c_xmax + pad_x)
+            y_min_c = max(y0 + 2.0, c_ymin - pad_y)
+            y_max_c = min(y1 - 2.0, c_ymax + pad_y)
+            wb = max(1.0, x_max_c - x_min_c)
+            hb = max(1.0, y_max_c - y_min_c)
+            if hb / wb > 1.65:
+                rad_c = 0.50 * wb
+            elif max(wb, hb) / min(wb, hb) < 1.15:
+                rad_c = 0.50 * min(wb, hb)
+            else:
+                rad_c = min(32.0, max(8.0, 0.22 * min(wb, hb)))
+            cad_poly = _build_smooth_rounded_poly(x_min_c, y_min_c, x_max_c, y_max_c, radius=rad_c, n_pts=256)
+            m_poly = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillPoly(m_poly, [np.round(cad_poly).astype(np.int32).reshape(-1, 1, 2)], 1)
+            cad_mask = fill_binary_holes((m_poly > 0) & back)
+            if _plausible_camera_island(cad_mask, back):
+                cands.append((0.92, cad_mask, cad_poly, "cad_cluster", cad_poly))
+
+        if not cands:
             # Fallback: Convex cluster hull with rounded padding as candidate.
             ys_l, xs_l = np.where(lenses)
             hull_pts = cv2.convexHull(np.column_stack([xs_l, ys_l]))
@@ -345,44 +380,62 @@ def _detect_and_cluster_lenses(
     bi_work = cv2.bilateralFilter(gray_work, 7, 45, 45)
     local_med = float(np.median(gray_work[top_work])) if top_work.any() else 128.0
 
-    min_r_w = max(3, int(round(0.012 * min_side * scale)))
-    max_r_w = max(min_r_w + 3, int(round(0.12 * min_side * scale)))
+    min_r_w = max(6, int(round(0.018 * min_side * scale)))
+    max_r_w = max(min_r_w + 4, int(round(0.15 * min_side * scale)))
 
-    detected_optics: list[tuple[float, float, float, float]] = []
+    bys_t, bxs_t = np.where(back)
+    x0_t, y0_t = float(bxs_t.min()), float(bys_t.min())
+    bw_t, bh_t = float(bxs_t.max() - x0_t + 1), float(bys_t.max() - y0_t + 1)
 
-    # 1. Hough circles with strict radial edge contrast validation.
-    circles = cv2.HoughCircles(
-        bi_work,
-        cv2.HOUGH_GRADIENT,
-        dp=1.0,
-        minDist=float(min_r_w * 1.6),
-        param1=45,
-        param2=18,
-        minRadius=min_r_w,
-        maxRadius=max_r_w,
-    )
-    if circles is not None:
-        for cx_w, cy_w, cr_w in np.round(circles[0]).astype(int):
-            if 0 <= cx_w < gray_work.shape[1] and 0 <= cy_w < gray_work.shape[0] and top_work[cy_w, cx_w]:
-                yy, xx = np.ogrid[0:gray_work.shape[0], 0:gray_work.shape[1]]
-                dist_sq = (xx - cx_w) ** 2 + (yy - cy_w) ** 2
-                inner = (dist_sq <= (cr_w * 0.70) ** 2) & top_work
-                outer = (dist_sq > (cr_w * 0.90) ** 2) & (dist_sq <= (cr_w * 1.35) ** 2) & top_work
-                if inner.any() and outer.any():
-                    in_val = float(np.mean(gray_work[inner]))
-                    out_val = float(np.mean(gray_work[outer]))
-                    diff = out_val - in_val
-                    if diff >= 8.0 or diff <= -15.0:
-                        detected_optics.append((
-                            float(cx_w) / scale,
-                            float(cy_w) / scale,
-                            float(cr_w) / scale,
-                            diff,
-                        ))
+    detected_optics: list[tuple[float, float, float, float, float]] = []
+
+    # 1. Hough circles with radial edge contrast validation.
+    for p2 in (26, 20):
+        circles = cv2.HoughCircles(
+            bi_work,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=float(min_r_w * 1.4),
+            param1=50,
+            param2=p2,
+            minRadius=min_r_w,
+            maxRadius=max_r_w,
+        )
+        if circles is not None and circles.shape[1] > 0:
+            for cx_w, cy_w, cr_w in np.round(circles[0]).astype(int):
+                if 0 <= cx_w < gray_work.shape[1] and 0 <= cy_w < gray_work.shape[0] and top_work[cy_w, cx_w]:
+                    cx_orig = float(cx_w) / scale
+                    cy_orig = float(cy_w) / scale
+                    fx = (cx_orig - x0_t) / max(bw_t, 1.0)
+                    fy = (cy_orig - y0_t) / max(bh_t, 1.0)
+                    # Reject central brand logo (e.g. Apple logo in center of phone)
+                    if 0.38 < fx < 0.62 and fy > 0.25:
+                        continue
+                    if fy > 0.40:
+                        continue
+
+                    yy, xx = np.ogrid[0:gray_work.shape[0], 0:gray_work.shape[1]]
+                    dist_sq = (xx - cx_w) ** 2 + (yy - cy_w) ** 2
+                    inner = (dist_sq <= (cr_w * 0.70) ** 2) & top_work
+                    outer = (dist_sq > (cr_w * 0.90) ** 2) & (dist_sq <= (cr_w * 1.35) ** 2) & top_work
+                    if inner.any() and outer.any():
+                        in_val = float(np.mean(gray_work[inner]))
+                        out_val = float(np.mean(gray_work[outer]))
+                        diff = abs(out_val - in_val)
+                        if diff >= 8.0:
+                            detected_optics.append((
+                                cx_orig,
+                                cy_orig,
+                                float(cr_w) / scale,
+                                diff,
+                                in_val,
+                            ))
+            if len(detected_optics) >= 1:
+                break
 
     # 2. High-contrast circular / compact blobs (optics blobs).
-    dark_bin = (gray_work < max(20.0, min(local_med - 16.0, 160.0))) & top_work
-    bright_bin = (gray_work > max(195.0, local_med + 45.0)) & top_work
+    dark_bin = (gray_work < max(20.0, min(local_med - 35.0, 75.0))) & top_work
+    bright_bin = (gray_work > max(215.0, local_med + 55.0)) & top_work
     opt_bin = dark_bin | bright_bin
 
     n, labels, stats, cents = cv2.connectedComponentsWithStats(opt_bin.astype(np.uint8), 8)
@@ -395,31 +448,61 @@ def _detect_and_cluster_lenses(
         if min(w_b, h_b) < min_r_w * 0.8 or max(w_b, h_b) > max_r_w * 2.2:
             continue
         aspect = max(w_b, h_b) / max(min(w_b, h_b), 1.0)
-        if aspect > 1.45:
+        if aspect > 1.35:
             continue
+
+        comp_u8 = (labels == i).astype(np.uint8)
+        cnts, _ = cv2.findContours(comp_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        peri = cv2.arcLength(cnts[0], True)
+        circ = 4.0 * np.pi * area / max(peri * peri, 1.0)
+        if circ < 0.72:
+            continue
+
         cx_w, cy_w = float(cents[i][0]), float(cents[i][1])
         cr_w = float(max(w_b, h_b) / 2.0)
+        cx_orig = cx_w / scale
+        cy_orig = cy_w / scale
+        fx = (cx_orig - x0_t) / max(bw_t, 1.0)
+        fy = (cy_orig - y0_t) / max(bh_t, 1.0)
+        if 0.38 < fx < 0.62 and fy > 0.25:
+            continue
+        if fy > 0.40:
+            continue
+
         already = False
-        for ocx, ocy, ocr, _ in detected_optics:
-            if np.hypot(cx_w / scale - ocx, cy_w / scale - ocy) < max(cr_w / scale, ocr) * 0.8:
+        for ocx, ocy, ocr, *_ in detected_optics:
+            if np.hypot(cx_orig - ocx, cy_orig - ocy) < max(cr_w / scale, ocr) * 0.8:
                 already = True
                 break
-        if not already:
+        if not already and top_work[int(cy_w), int(cx_w)]:
             in_val = float(np.mean(gray_work[labels == i]))
-            diff = local_med - in_val
+            diff = abs(local_med - in_val)
             detected_optics.append((
-                cx_w / scale,
-                cy_w / scale,
+                cx_orig,
+                cy_orig,
                 cr_w / scale,
                 diff,
+                in_val,
             ))
 
     if not detected_optics:
         return np.zeros((height, width), dtype=bool), 0, []
 
+    # Camera lenses absorb light and have dark pupils.
+    has_dark_pupil = any(opt[4] < max(70.0, local_med - 25.0) for opt in detected_optics)
+    if not has_dark_pupil:
+        return np.zeros((height, width), dtype=bool), 0, []
+
+    # Sort by contrast and cap at 12 candidates
+    detected_optics.sort(key=lambda x: abs(x[3]), reverse=True)
+    detected_optics = detected_optics[:12]
+
     # 3. Spatial clustering of optics into a cohesive camera module cluster.
     pts = np.array([[o[0], o[1]] for o in detected_optics])
-    max_d = max(24.0, 0.25 * min_side)
+    max_dx = max(24.0, 0.26 * min_side)
+    max_dy = max(35.0, 0.34 * min_side)
 
     clusters: list[list[int]] = []
     visited: set[int] = set()
@@ -433,18 +516,25 @@ def _detect_and_cluster_lenses(
             curr = q.pop(0)
             for j in range(len(detected_optics)):
                 if j not in visited:
-                    d = float(np.hypot(pts[curr, 0] - pts[j, 0], pts[curr, 1] - pts[j, 1]))
-                    if d <= max_d:
+                    dx = abs(pts[curr, 0] - pts[j, 0])
+                    dy = abs(pts[curr, 1] - pts[j, 1])
+                    if dx <= max_dx and dy <= max_dy:
                         visited.add(j)
                         cluster.append(j)
                         q.append(j)
         clusters.append(cluster)
 
-    best_cl = max(clusters, key=len)
+    # Sort clusters by number of optics and total contrast
+    clusters.sort(key=lambda cl: (len(cl), sum(detected_optics[idx][3] for idx in cl)), reverse=True)
+    best_cl = clusters[0]
     cl_optics = [detected_optics[idx] for idx in best_cl]
 
+    # Ensure the winning cluster contains at least one dark lens element
+    if not any(opt[4] < max(70.0, local_med - 25.0) for opt in cl_optics):
+        return np.zeros((height, width), dtype=bool), 0, []
+
     clustered_mask = np.zeros((height, width), dtype=bool)
-    for cx, cy, cr, _ in cl_optics:
+    for cx, cy, cr, *_ in cl_optics:
         cv2.circle(
             clustered_mask.view(np.uint8),
             (int(round(cx)), int(round(cy))),
@@ -453,7 +543,8 @@ def _detect_and_cluster_lenses(
             thickness=cv2.FILLED,
         )
 
-    return clustered_mask & top & back, len(cl_optics), cl_optics
+    clean_optics = [(o[0], o[1], o[2], o[3]) for o in cl_optics]
+    return clustered_mask & top & back, len(clean_optics), clean_optics
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +593,7 @@ def _trace_outer_bevel_rim(
     min_side: float,
     back_area: float,
     optics_list: list[tuple[float, float, float, float]] | None = None,
-) -> tuple[np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Trace the actual physical camera rim contour geometrically from image edge gradients.
 
     Determines the exact physical bounds along Left, Right, Top, Bottom and
@@ -513,7 +604,7 @@ def _trace_outer_bevel_rim(
     if not optics_list or len(optics_list) == 0:
         ys, xs = np.where(lenses)
         if ys.size == 0:
-            return np.zeros((height, width), dtype=bool), None
+            return np.zeros((height, width), dtype=bool), None, None
         c_xmin, c_xmax = float(xs.min()), float(xs.max())
         c_ymin, c_ymax = float(ys.min()), float(ys.max())
     else:
@@ -532,53 +623,61 @@ def _trace_outer_bevel_rim(
     gx[~back] = 0
     gy[~back] = 0
 
-    min_pad = max(2.0, 0.008 * min_side)
-    max_pad = max(min_pad + 4.0, 0.045 * min_side)
-
     bys, bxs = np.where(back)
     b_xmin, b_xmax = int(bxs.min()), int(bxs.max())
     b_ymin, b_ymax = int(bys.min()), int(bys.max())
+    bw_back = float(max(1, b_xmax - b_xmin))
+    bh_back = float(max(1, b_ymax - b_ymin))
+
+    pad_l = max(4.0, min(0.06 * bw_back, 25.0))
+    pad_r = max(4.0, min(0.12 * bw_back, 45.0))  # Covers flash & secondary sensors to the right
+    pad_t = max(4.0, min(0.06 * bh_back, 25.0))
+    pad_b = max(4.0, min(0.14 * bh_back, 60.0))
 
     # 1. Left rim peak
-    l_min = max(b_xmin + 2, int(round(c_xmin - max_pad)))
-    l_max = max(b_xmin + 2, int(round(c_xmin - min_pad)))
+    l_min = max(b_xmin + 2, int(round(c_xmin - pad_l)))
+    l_max = max(b_xmin + 2, int(round(c_xmin - 2.0)))
     l_range = range(l_min, min(width - 1, l_max + 1))
-    gl = [float(np.mean(gx[int(max(0, c_ymin)):int(min(height, c_ymax + 1)), x])) for x in l_range]
-    left_x = float(l_range[int(np.argmax(gl))]) if gl else c_xmin - min_pad
+    gl = [float(np.mean(gx[int(max(0, c_ymin)):int(min(height, c_ymax + 1)), x])) for x in l_range] if l_max > l_min else []
+    left_x = float(l_range[int(np.argmax(gl))]) if (gl and max(gl) > 10.0) else c_xmin - 5.0
 
-    # 2. Right rim peak
-    r_min = min(b_xmax - 2, int(round(c_xmax + min_pad)))
-    r_max = min(b_xmax - 2, int(round(c_xmax + max_pad)))
+    # 2. Right rim peak (covers flash!)
+    r_min = min(b_xmax - 2, int(round(c_xmax + 2.0)))
+    r_max = min(b_xmax - 2, int(round(c_xmax + pad_r)))
     r_range = range(r_min, min(width - 1, r_max + 1))
-    gr = [float(np.mean(gx[int(max(0, c_ymin)):int(min(height, c_ymax + 1)), x])) for x in r_range]
-    right_x = float(r_range[int(np.argmax(gr))]) if gr else c_xmax + min_pad
+    gr = [float(np.mean(gx[int(max(0, c_ymin)):int(min(height, c_ymax + 1)), x])) for x in r_range] if r_max > r_min else []
+    right_x = float(r_range[int(np.argmax(gr))]) if (gr and max(gr) > 10.0) else c_xmax + 5.0
 
     # 3. Top rim peak
-    t_min = max(b_ymin + 2, int(round(c_ymin - max_pad)))
-    t_max = max(b_ymin + 2, int(round(c_ymin - min_pad)))
+    t_min = max(b_ymin + 2, int(round(c_ymin - pad_t)))
+    t_max = max(b_ymin + 2, int(round(c_ymin - 2.0)))
     t_range = range(t_min, min(height - 1, t_max + 1))
-    gt = [float(np.mean(gy[y, int(max(0, c_xmin)):int(min(width, c_xmax + 1))])) for y in t_range]
-    top_y = float(t_range[int(np.argmax(gt))]) if gt else c_ymin - min_pad
+    gt = [float(np.mean(gy[y, int(max(0, c_xmin)):int(min(width, c_xmax + 1))])) for y in t_range] if t_max > t_min else []
+    top_y = float(t_range[int(np.argmax(gt))]) if (gt and max(gt) > 10.0) else c_ymin - 5.0
 
     # 4. Bottom rim peak
-    b_min = min(b_ymax - 2, int(round(c_ymax + min_pad)))
-    b_max = min(b_ymax - 2, int(round(c_ymax + max_pad)))
+    b_min = min(b_ymax - 2, int(round(c_ymax + 2.0)))
+    b_max = min(b_ymax - 2, int(round(c_ymax + pad_b)))
     b_range = range(b_min, min(height - 1, b_max + 1))
-    gb = [float(np.mean(gy[y, int(max(0, c_xmin)):int(min(width, c_xmax + 1))])) for y in b_range]
-    bot_y = float(b_range[int(np.argmax(gb))]) if gb else c_ymax + min_pad
+    gb = [float(np.mean(gy[y, int(max(0, c_xmin)):int(min(width, c_xmax + 1))])) for y in b_range] if b_max > b_min else []
+    bot_y = float(b_range[int(np.argmax(gb))]) if (gb and max(gb) > 10.0) else c_ymax + 5.0
 
     w_box = max(1.0, right_x - left_x)
     h_box = max(1.0, bot_y - top_y)
+    if w_box > 0.65 * bw_back or h_box > 0.42 * bh_back:
+        return np.zeros((height, width), dtype=bool), None, None
+
     aspect = max(w_box, h_box) / min(w_box, h_box)
 
     # 1. Outer rim radius
-    if len(optics_list) == 1 and aspect < 1.15:
-        radius_out = 0.50 * min(w_box, h_box)
-    elif aspect > 1.65:
-        radius_out = 0.50 * min(w_box, h_box)
+    if w_box / max(h_box, 1.0) > 1.45:
+        radius_out = 0.50 * h_box  # Horizontal pill (e.g. iPhone 7 Plus, Pixel camera bar)
+    elif h_box / max(w_box, 1.0) > 1.45:
+        radius_out = 0.50 * w_box  # Vertical capsule / pill (e.g. iPhone 16 dual camera, Vivo Y19)
+    elif len(optics_list or []) == 1 and aspect < 1.15:
+        radius_out = 0.50 * min(w_box, h_box)  # Circular camera bump
     else:
-        radius_out = max(6.0, min(0.18 * min(w_box, h_box), 45.0))
-        radius_out = min(radius_out, 0.45 * min(w_box, h_box))
+        radius_out = min(32.0, max(8.0, 0.22 * min(w_box, h_box)))  # Squircle / rounded rectangle
 
     # 2. Inner opening bounds (tightly enclosing the optics plateau)
     in_pad = max(1.5, min(0.006 * min_side, 4.0))
@@ -591,42 +690,97 @@ def _trace_outer_bevel_rim(
     h_in = max(1.0, in_bot - in_top)
     aspect_in = max(w_in, h_in) / min(w_in, h_in)
 
-    if len(optics_list) == 1 and aspect_in < 1.15:
-        radius_in = 0.50 * min(w_in, h_in)
-    elif aspect_in > 1.65:
+    if h_in / max(w_in, 1.0) > 1.65:
+        radius_in = 0.50 * w_in
+    elif len(optics_list or []) == 1 and aspect_in < 1.15:
         radius_in = 0.50 * min(w_in, h_in)
     else:
-        radius_in = max(5.0, min(0.18 * min(w_in, h_in), 38.0))
+        radius_in = max(5.0, min(0.18 * min(w_in, h_in), 28.0))
         radius_in = min(radius_in, 0.45 * min(w_in, h_in))
 
     # Construct both smooth rounded polygons
     in_poly = _build_smooth_rounded_poly(in_left, in_top, in_right, in_bot, radius=radius_in, n_pts=256)
-    out_poly = _build_smooth_rounded_poly(left_x, top_y, right_x, bot_y, radius=radius_out, n_pts=256)
-
-    # Sub-pixel snap to physical rim edges
-    snapped_in = _snap_contour_to_rim(rgb, in_poly, lenses, back)
-    if snapped_in is not None:
-        in_poly = snapped_in
-
-    snapped_out = _snap_contour_to_rim(rgb, out_poly, lenses, back)
-    if snapped_out is not None:
-        out_poly = snapped_out
+    out_poly = _build_smooth_rounded_poly(left_x - 1.5, top_y - 1.5, right_x + 1.5, bot_y + 1.5, radius=radius_out, n_pts=256)
 
     final_in_contour = _smooth_closed(_resample_closed(in_poly, 256), sigma_frac=0.0025)
     final_out_contour = _smooth_closed(_resample_closed(out_poly, 256), sigma_frac=0.0025)
 
-    # The exclusion mask is rasterized from the INNER camera opening,
-    # so the artwork WRAPS/PRINTS on top of the raised rim and terminates
-    # right at the actual camera hardware plateau opening!
     mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(mask, [np.round(final_in_contour).astype(np.int32).reshape(-1, 1, 2)], 1)
+    cv2.fillPoly(mask, [np.round(final_out_contour).astype(np.int32).reshape(-1, 1, 2)], 1)
     b_mask = (mask > 0) & back
     b_mask = fill_binary_holes(b_mask)
 
     if _plausible_camera_island(b_mask, back):
-        return b_mask, final_in_contour, final_out_contour
+        return b_mask, final_out_contour, final_out_contour
 
     return np.zeros((height, width), dtype=bool), None, None
+
+
+def _radial_ridge_island(
+    rgb: np.ndarray,
+    top: np.ndarray,
+    back: np.ndarray,
+    min_side: float,
+    optics_list: list[tuple[float, float, float, float]],
+) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+    """Omnidirectional radial ridge snapping for arbitrary camera shapes (circular, pill, squircle, or custom)."""
+    if not optics_list or len(optics_list) == 0:
+        return None, None, 0.0
+
+    height, width = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    bi = cv2.bilateralFilter(gray, 7, 45, 45)
+    gx = cv2.Sobel(bi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(bi, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx**2 + gy**2)
+    grad[~back] = 0
+
+    back_area = float(np.count_nonzero(back))
+
+    xs = [o[0] for o in optics_list]
+    ys = [o[1] for o in optics_list]
+    rs = [o[2] for o in optics_list]
+    cx, cy = float(np.mean(xs)), float(np.mean(ys))
+
+    r_optics_max = max(np.hypot(xs[i] - cx, ys[i] - cy) + rs[i] for i in range(len(optics_list)))
+
+    n_rays = 64
+    angles = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+    r_min = r_optics_max + max(2.0, 0.008 * min_side)
+    r_max = r_optics_max + max(12.0, 0.085 * min_side)
+
+    ray_pts = []
+    for ang in angles:
+        cos_a, sin_a = np.cos(ang), np.sin(ang)
+        dists = np.linspace(r_min, r_max, 40)
+        rx = np.clip(cx + dists * cos_a, 0, width - 1)
+        ry = np.clip(cy + dists * sin_a, 0, height - 1)
+
+        g_vals = cv2.remap(
+            grad,
+            rx.astype(np.float32).reshape(1, -1),
+            ry.astype(np.float32).reshape(1, -1),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        ).ravel()
+        best_idx = int(np.argmax(g_vals))
+        best_r = dists[best_idx]
+        ray_pts.append([cx + best_r * cos_a, cy + best_r * sin_a])
+
+    ray_poly = np.array(ray_pts, dtype=np.float64)
+    smoothed = _smooth_closed(_resample_closed(ray_poly, 128), sigma_frac=0.004)
+
+    m_poly = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(m_poly, [np.round(smoothed).astype(np.int32).reshape(-1, 1, 2)], 1)
+    island_mask = fill_binary_holes((m_poly > 0) & back)
+    area = float(np.count_nonzero(island_mask))
+    if 0.012 * back_area <= area <= 0.32 * back_area and _plausible_camera_island(island_mask, back):
+        b_ring = cv2.dilate(m_poly, np.ones((3, 3), np.uint8)) - m_poly
+        mean_g = float(np.mean(grad[b_ring > 0])) if np.any(b_ring) else 0.0
+        conf = 0.88 + 0.12 * min(1.0, mean_g / 35.0)
+        return island_mask, smoothed, conf
+
+    return None, None, 0.0
 
 
 
@@ -667,7 +821,7 @@ def _find_closed_edge_loops(
     _, grad_bin = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     edge_maps.append(grad_bin)
 
-    min_a = 0.012 * back_area
+    min_a = max(120.0, 0.003 * back_area)
     max_a = 0.40 * back_area
 
     for emap in edge_maps:
@@ -682,15 +836,15 @@ def _find_closed_edge_loops(
                 peri = float(cv2.arcLength(contour, True))
                 if peri < 20:
                     continue
-                circ = 4.0 * np.pi * area / max(peri * peri, 1.0)
-                if circ > 0.65 and area < 0.025 * back_area:
+                circ = 4.0 * np.pi * area / max(peri * peri, 1.0) if peri > 0 else 0.0
+                if circ > 0.65 and area < 0.015 * back_area:
                     continue
-                if circ > 0.95:
+                if circ > 0.98:
                     continue
 
                 x, y, cw, ch = cv2.boundingRect(contour)
                 aspect = max(cw, ch) / float(max(min(cw, ch), 1))
-                if aspect > 2.5:
+                if aspect > 2.85:
                     continue
                 solidity = area / float(max(cw * ch, 1))
                 if solidity < 0.45:
@@ -701,7 +855,7 @@ def _find_closed_edge_loops(
                     continue
                 cy = M["m01"] / M["m00"]
                 fy = (cy - y0) / float(max(bh, 1))
-                if fy > 0.58:
+                if fy > 0.60:
                     continue
 
                 filled = np.zeros((height, width), dtype=np.uint8)
@@ -713,15 +867,15 @@ def _find_closed_edge_loops(
                     continue
 
                 pts = contour.reshape(-1, 2).astype(np.float64)
-                rect_bonus = 0.15 if (aspect <= 1.4 and solidity >= 0.80) else 0.0
+                rect_bonus = 0.15 if (aspect <= 1.5 and solidity >= 0.75) else 0.0
                 score = 0.75 + 0.12 * solidity + rect_bonus
 
                 if n_lenses >= 1 and lenses is not None and lenses.any():
                     cover_frac = float(np.count_nonzero(blob & lenses)) / max(float(np.count_nonzero(lenses)), 1.0)
-                    if cover_frac >= 0.70:
+                    if cover_frac >= 0.65:
                         score = min(0.98, score + 0.25)
-                    elif cover_frac < 0.25:
-                        score = max(0.15, score - 0.35)
+                    elif cover_frac < 0.20:
+                        score = max(0.20, score - 0.20)
 
                 results.append((score, blob, pts))
 
@@ -898,7 +1052,7 @@ def _color_gradient_candidates(
         if M["m00"] < 1:
             continue
         cy = M["m01"] / M["m00"]
-        if (cy - y0) / float(max(bh, 1)) > 0.48:
+        if (cy - y0) / float(max(bh, 1)) > 0.42:
             continue
 
         filled = np.zeros((height, width), dtype=np.uint8)
@@ -985,16 +1139,25 @@ def _rank_camera_candidates(
         single_lens_penalty = 0.0
         if lenses is not None and lenses.any():
             cover_ratio = float(np.count_nonzero(mask & lenses)) / max(float(np.count_nonzero(lenses)), 1.0)
-            if cover_ratio >= 0.70:
+            if cover_ratio >= 0.50:
                 lens_bonus = 0.50
-            elif cover_ratio < 0.35:
-                lens_bonus = -0.50
+            elif cover_ratio < 0.20:
+                lens_bonus = -0.30
 
-            if (circ > 0.60 or cover_ratio < 0.40) and area_frac < 0.12 and n_lenses >= 2:
-                single_lens_penalty = -0.90  # Strictly reject individual lens circular cutouts
+            if circ > 0.75 and cover_ratio < 0.40 and area_frac < 0.06 and n_lenses >= 2:
+                single_lens_penalty = -0.80  # Strictly reject individual lens circular cutouts
 
         squircle_bonus = 0.22 if (aspect <= 1.50 and solidity >= 0.75 and area_frac >= 0.020) else 0.0
-        rim_bonus = 0.25 if source == "rim_trace" else 0.0
+        rim_bonus = 0.25 if source in ("rim_trace", "radial_ridge", "cad_cluster") else 0.0
+        is_solid_island = (
+            source in ("edge_loop", "rim_trace", "cad_cluster")
+            and solidity >= 0.70
+            and 0.012 <= area_frac <= 0.15
+        )
+        if (lenses is None or not lenses.any() or n_lenses == 0) and source != "alpha":
+            no_lens_penalty = -0.10 if is_solid_island else -0.55
+        else:
+            no_lens_penalty = 0.0
 
         total_score = (
             0.35 * base_conf
@@ -1007,6 +1170,7 @@ def _rank_camera_candidates(
             + rim_bonus
             + lens_bonus
             + single_lens_penalty
+            + no_lens_penalty
             - 0.06 * max(0.0, aspect - 1.5)
         )
         scored.append((total_score, mask, contour, source, out_contour))
@@ -1245,15 +1409,18 @@ def _plausible_camera_island(mask: np.ndarray, back: np.ndarray) -> bool:
     aspect = max(w, h) / float(max(min(w, h), 1))
     extent = area / float(max(w * h, 1))
     cy = float(ys.mean())
+    cx = float(xs.mean())
     frac = area / max(back_area, 1.0)
     frac_y = (cy - y0) / float(bh)
-    is_tall = (bh / float(max(bw, 1)) >= 1.4)
-    max_w = 0.85 * bw if is_tall else 0.96 * bw
-    max_h = 0.55 * bh if is_tall else 0.96 * bh
-    max_frac = 0.35 if is_tall else 0.88
-    max_frac_y = 0.58 if is_tall else 0.88
+    frac_x = (cx - x0) / float(bw)
 
-    if aspect > 2.80:
+    is_tall = (bh / float(max(bw, 1)) >= 1.4)
+    max_w = 0.65 * bw if is_tall else 0.85 * bw
+    max_h = 0.40 * bh if is_tall else 0.48 * bh
+    max_frac = 0.25 if is_tall else 0.40
+    max_frac_y = 0.40 if is_tall else 0.45
+
+    if aspect > 3.80:
         return False
     if w > max_w or h > max_h:
         return False
@@ -1262,6 +1429,9 @@ def _plausible_camera_island(mask: np.ndarray, back: np.ndarray) -> bool:
     if extent < 0.38:
         return False
     if frac_y > max_frac_y:
+        return False
+    # Central brand logo rejection (e.g. Apple logo, Samsung center text)
+    if 0.38 < frac_x < 0.62 and frac_y > 0.25 and frac < 0.040:
         return False
     if h < 0.025 * bh and w > 0.40 * bw:
         return False

@@ -303,6 +303,11 @@ class MainWindow(QMainWindow):
         self.btn_jpg.clicked.connect(lambda: self._on_export("jpg"))
         ex.addWidget(self.btn_png)
         ex.addWidget(self.btn_jpg)
+
+        self.btn_make_mockups = QPushButton("✨ MAKE MOCKUPS (10 Scenes)")
+        self.btn_make_mockups.setObjectName("primary")
+        self.btn_make_mockups.clicked.connect(self._on_make_mockups)
+        ex.addWidget(self.btn_make_mockups)
         layout.addWidget(export)
 
         self.btn_reset = QPushButton("Reset")
@@ -790,6 +795,16 @@ class MainWindow(QMainWindow):
             return
         self._set_status(f"Saved {path.name}")
 
+    def _on_make_mockups(self) -> None:
+        if self.processor.cover is None or self.processor.design is None or self._result is None:
+            self._show_error("Upload a phone cover and design first to generate mockups.")
+            return
+
+        from app.ui.mockup_generator_window import MockupGeneratorWindow
+
+        studio = MockupGeneratorWindow(self.processor, self._result, parent=self)
+        studio.exec()
+
     def _on_debug_clicked(self, key: str) -> None:
         self._final_key = key
         self._refresh_previews(keep_mask=True)
@@ -912,6 +927,8 @@ class MainWindow(QMainWindow):
     def _set_export_enabled(self, enabled: bool) -> None:
         self.btn_png.setEnabled(enabled)
         self.btn_jpg.setEnabled(enabled)
+        if hasattr(self, "btn_make_mockups"):
+            self.btn_make_mockups.setEnabled(enabled)
 
     def _set_buttons_enabled(self, enabled: bool) -> None:
         self.btn_cover.setEnabled(enabled)

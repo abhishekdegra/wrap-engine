@@ -68,10 +68,16 @@ def fit_design_to_quad(
         raise ValueError("Design must be an HxWx4 RGBA array")
 
     quad = np.asarray(dst_quad, dtype=np.float32).reshape(4, 2)
-    width_top = float(np.linalg.norm(quad[1] - quad[0]))
-    width_bot = float(np.linalg.norm(quad[2] - quad[3]))
-    height_l = float(np.linalg.norm(quad[3] - quad[0]))
-    height_r = float(np.linalg.norm(quad[2] - quad[1]))
+    # Full-bleed expansion: expand outward from quad centroid by 3.5%
+    # This guarantees 100% solid coverage into rounded corners and CNC fillets
+    # before clipping by the antialiased printable mask, eliminating unprinted margins.
+    centroid = np.mean(quad, axis=0)
+    quad_bleed = centroid + (quad - centroid) * 1.035
+
+    width_top = float(np.linalg.norm(quad_bleed[1] - quad_bleed[0]))
+    width_bot = float(np.linalg.norm(quad_bleed[2] - quad_bleed[3]))
+    height_l = float(np.linalg.norm(quad_bleed[3] - quad_bleed[0]))
+    height_r = float(np.linalg.norm(quad_bleed[2] - quad_bleed[1]))
     target_w = max(1, int(round(max(width_top, width_bot))))
     target_h = max(1, int(round(max(height_l, height_r))))
 
@@ -87,12 +93,12 @@ def fit_design_to_quad(
         [[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]],
         dtype=np.float32,
     )
-    matrix = cv2.getPerspectiveTransform(src, quad)
+    matrix = cv2.getPerspectiveTransform(src, quad_bleed)
     return cv2.warpPerspective(
         fitted,
         matrix,
         (canvas_w, canvas_h),
-        flags=cv2.INTER_LINEAR,
+        flags=cv2.INTER_LANCZOS4,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0),
     )

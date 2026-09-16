@@ -51,6 +51,7 @@ class CoverDetection:
     camera_contour: np.ndarray | None = None
     # List of binary masks for individual lens/flash openings inside the camera rim.
     camera_openings: list[np.ndarray] = field(default_factory=list)
+    pose: Any = None
 
 
 def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
@@ -58,33 +59,56 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
     if cover_rgba.ndim != 3 or cover_rgba.shape[2] != 4:
         raise CoverError("The cover image could not be read as an RGBA image.")
 
+    from app.core.cover_geometry import detect_authoritative_geometry
+
     height, width = cover_rgba.shape[:2]
     alpha = cover_rgba[..., 3]
     has_alpha = bool(int(alpha.min()) < 250 or int(np.percentile(alpha, 5)) < 240)
 
-    if has_alpha and int(alpha.max()) >= 12:
-        outer = _outer_from_alpha(alpha)
-        # If alpha silhouette is tiny/circular, treat as opaque photo.
-        if _phone_score(outer, height, width) < 0.35:
+    # Multi-stage authoritative geometry detection
+    pose = None
+    geom = None
+    try:
+        geom = detect_authoritative_geometry(cover_rgba, feather_px=MASK_FEATHER_PX)
+        outer_filled = geom.outer_bin
+        back_full = geom.printable_bin
+        raw_outer = outer_filled
+        confidence_val = geom.confidence
+        auth_mask = geom.printable_mask
+        outer_mask = np.clip(geom.rim_mask + geom.printable_mask, 0.0, 1.0).astype(np.float32)
+        pose = getattr(geom, "pose", None)
+    except Exception:
+        # Robust fallback if anything fails
+        if has_alpha and int(alpha.max()) >= 12:
+            outer = _outer_from_alpha(alpha)
+            if _phone_score(outer, height, width) < 0.35:
+                outer = _outer_from_rgb(cover_rgba[..., :3])
+                has_alpha = False
+        else:
             outer = _outer_from_rgb(cover_rgba[..., :3])
             has_alpha = False
-    else:
-        outer = _outer_from_rgb(cover_rgba[..., :3])
-        has_alpha = False
 
-    if not outer.any():
+        if not outer.any():
+            raise CoverError(
+                "Could not find a phone cover in this image.\n"
+                "Try a front-facing photo of the case on a plain background."
+            )
+
+        raw_outer = _fill_holes(_largest_component(outer))
+        outer_filled = raw_outer
+        min_side = float(min(width, height))
+        outer_filled = _polish_cover_contour(_clean_cover_silhouette(outer_filled))
+        outer_filled = _fill_shallow_notches(outer_filled, min_side)
+        outer_filled = refine_outer_binary(outer_filled)
+        back_full = _inner_printable_panel(cover_rgba, outer_filled, has_alpha, min_side)
+        confidence_val = 0.50
+        auth_mask = None
+        outer_mask = None
+
+    if not outer_filled.any() or not back_full.any():
         raise CoverError(
             "Could not find a phone cover in this image.\n"
             "Try a front-facing photo of the case on a plain background."
-        )
-
-    raw_outer = _fill_holes(_largest_component(outer))
-    outer_filled = raw_outer
-
-    if _phone_score(outer_filled, height, width) < 0.28:
-        raise CoverError(
-            "Could not find a large phone-shaped outline in this image.\n"
-            "Use a clearer front-facing photo of the whole case."
         )
 
     min_side = float(min(width, height))
@@ -92,64 +116,73 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
     if bbox is not None:
         min_side = float(min(bbox[2], bbox[3]))
 
-    outer_filled = _polish_cover_contour(_clean_cover_silhouette(outer_filled))
-    outer_filled = _fill_shallow_notches(outer_filled, min_side)
-    outer_filled = refine_outer_binary(outer_filled)
-    bbox = _bbox(outer_filled)
-    if bbox is not None:
-        min_side = float(min(bbox[2], bbox[3]))
+    # STAGE 4: Camera area separation
+    # If phone has a non-upright pose, run camera detection in canonical space where phone is upright!
+    if pose is not None and not pose.is_upright and getattr(geom, "canon_cover", None) is not None:
+        canon_w, canon_h = pose.canonical_size
+        min_side_c = float(min(canon_w, canon_h))
+        safety_px_c = max(CAMERA_SAFETY_MIN_PX, CAMERA_SAFETY_FRACTION * min_side_c)
+        outer_c = (geom.canon_outer_mask >= 0.5) if getattr(geom, "canon_outer_mask", None) is not None else np.ones((canon_h, canon_w), dtype=bool)
+        # Search for camera island across the full canonical phone surface before cutout
+        cam_res = detect_camera(geom.canon_cover, outer_c, outer_c, safety_px_c)
+        if len(cam_res) == 7:
+            cam_c, camera_found, cam_conf, cam_warnings, cam_contour_c, cam_openings_c, cam_outer_rim_c = cam_res
+        else:
+            cam_c, camera_found, cam_conf, cam_warnings, cam_contour_c, cam_openings_c = cam_res[:6]
+            cam_outer_rim_c = None
 
-    safety_px = max(CAMERA_SAFETY_MIN_PX, CAMERA_SAFETY_FRACTION * min_side)
-    back_full = _inner_printable_panel(cover_rgba, outer_filled, has_alpha, min_side)
-    if not back_full.any():
-        raise CoverError(
-            "The cover outline was found, but the inner back panel is too small.\n"
-            "Try a flatter, front-facing photo of the case."
-        )
-
-    cam_res = detect_camera(
-        cover_rgba, outer_filled, back_full, safety_px
-    )
-    if len(cam_res) == 7:
-        camera, camera_found, cam_conf, cam_warnings, cam_contour, cam_openings, cam_outer_rim = cam_res
+        if camera_found and cam_conf < 0.48:
+            camera = np.zeros_like(back_full)
+            camera_found = False
+            cam_contour = None
+            cam_openings = []
+            cam_outer_rim = None
+        else:
+            camera = cv2.warpPerspective(cam_c.astype(np.uint8), pose.H_from_canon, (width, height), flags=cv2.INTER_NEAREST) > 0
+            cam_contour = (
+                cv2.perspectiveTransform(cam_contour_c.reshape(-1, 1, 2).astype(np.float32), pose.H_from_canon).reshape(-1, 2)
+                if (cam_contour_c is not None and len(cam_contour_c) >= 3)
+                else None
+            )
+            cam_outer_rim = (
+                cv2.perspectiveTransform(cam_outer_rim_c.reshape(-1, 1, 2).astype(np.float32), pose.H_from_canon).reshape(-1, 2)
+                if (cam_outer_rim_c is not None and len(cam_outer_rim_c) >= 3)
+                else None
+            )
+            cam_openings = [
+                cv2.warpPerspective(op.astype(np.uint8), pose.H_from_canon, (width, height), flags=cv2.INTER_NEAREST) > 0
+                for op in cam_openings_c
+            ] if cam_openings_c else []
     else:
-        camera, camera_found, cam_conf, cam_warnings, cam_contour, cam_openings = cam_res[:6]
-        cam_outer_rim = None
+        safety_px = max(CAMERA_SAFETY_MIN_PX, CAMERA_SAFETY_FRACTION * min_side)
+        cam_res = detect_camera(cover_rgba, outer_filled, back_full, safety_px)
+        if len(cam_res) == 7:
+            camera, camera_found, cam_conf, cam_warnings, cam_contour, cam_openings, cam_outer_rim = cam_res
+        else:
+            camera, camera_found, cam_conf, cam_warnings, cam_contour, cam_openings = cam_res[:6]
+            cam_outer_rim = None
 
-    if camera_found and cam_conf < 0.48:
-        camera = np.zeros_like(back_full)
-        camera_found = False
-        cam_contour = None
-        cam_openings = []
-        cam_outer_rim = None
-        cam_warnings = list(cam_warnings) + [
-            "Camera detection was uncertain, so it was not applied. "
-            "Use “Mark camera area” if the cutout is missing."
-        ]
+        if camera_found and cam_conf < 0.48:
+            camera = np.zeros_like(back_full)
+            camera_found = False
+            cam_contour = None
+            cam_openings = []
+            cam_outer_rim = None
+            cam_warnings = list(cam_warnings) + [
+                "Camera detection was uncertain, so it was not applied. "
+                "Use “Mark camera area” if the cutout is missing."
+            ]
 
-    # If an isolated camera wasn't detected inside the plate, check if the printable panel
-    # already has the camera island excluded along the upper perimeter/corners (e.g. OPPO, OnePlus, bumper cases).
-    if not camera_found:
-        box = _bbox(back_full)
-        if box is not None and box[2] >= 10 and box[3] >= 10:
-            bx, by, bw, bh = box
-            top_h = int(0.35 * bh)
-            tl_box = back_full[by : by + top_h, bx : bx + int(0.45 * bw)]
-            tr_box = back_full[by : by + top_h, bx + int(0.55 * bw) : bx + bw]
-            if float(tl_box.mean()) < 0.40 or float(tr_box.mean()) < 0.40:
-                camera_found = True
-                cam_warnings = []
-    quad = back_panel_quad(back_full)
-    print_margin = max(PRINT_MARGIN_MIN_PX, PRINT_MARGIN_FRACTION * min_side)
-    print_body = back_full
-    if print_margin > 0.5:
-        inset_body = inset_smooth(back_full, print_margin, sigma=0.6)
-        if inset_body.any():
-            print_body = inset_body
-    back_printable = print_body & ~camera
+    if getattr(geom, "inner_quad", None) is not None:
+        quad = geom.inner_quad
+    elif pose is not None and getattr(pose, "quad", None) is not None:
+        quad = pose.quad
+    else:
+        quad = back_panel_quad(back_full)
+
+    back_printable = back_full & ~camera
 
     if not back_printable.any() or float(back_printable.mean()) < 0.04:
-        # Camera exclusion must never wipe the panel — drop auto camera instead of failing.
         camera = np.zeros_like(back_full)
         camera_found = False
         cam_contour = None
@@ -159,7 +192,7 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
             "Automatic camera exclusion removed too much of the back panel, so it was skipped. "
             "Mark the camera area if needed."
         ]
-        back_printable = print_body
+        back_printable = back_full
 
     return _pack_detection(
         cover_rgba,
@@ -175,6 +208,10 @@ def detect_cover(cover_rgba: np.ndarray) -> CoverDetection:
         camera_contour=cam_contour,
         camera_openings=cam_openings,
         camera_outer_rim=cam_outer_rim,
+        authoritative_printable_mask=auth_mask,
+        authoritative_outer_mask=outer_mask,
+        authoritative_confidence=confidence_val,
+        pose=pose,
     )
 
 
@@ -209,7 +246,7 @@ def apply_manual_camera(
     if not back_printable.any():
         raise CoverError("That camera box covers the whole back panel. Draw a smaller box.")
 
-    quad = back_panel_quad(detection.back_full)
+    quad = detection.back_quad if detection.back_quad is not None else back_panel_quad(detection.back_full)
     return _pack_detection(
         cover_rgba,
         detection.outer_bin,
@@ -221,6 +258,10 @@ def apply_manual_camera(
         detection.has_alpha,
         [],
         raw_outer=detection.raw_outer if detection.raw_outer is not None else detection.outer_bin,
+        authoritative_printable_mask=detection.masks.printable_back,
+        authoritative_outer_mask=detection.masks.outer,
+        authoritative_confidence=detection.confidence,
+        pose=detection.pose,
     )
 
 
@@ -243,7 +284,7 @@ def apply_manual_camera_mask(
     back_printable = print_body & ~(cam > 0.45)
     if print_body.any() and float(np.count_nonzero(back_printable)) < 0.04 * float(np.count_nonzero(print_body)):
         raise CoverError("That camera mask covers the whole back panel. Draw a smaller area.")
-    quad = back_panel_quad(detection.back_full)
+    quad = detection.back_quad if detection.back_quad is not None else back_panel_quad(detection.back_full)
     packed = _pack_detection(
         cover_rgba,
         detection.outer_bin,
@@ -255,6 +296,10 @@ def apply_manual_camera_mask(
         detection.has_alpha,
         [],
         raw_outer=detection.raw_outer if detection.raw_outer is not None else detection.outer_bin,
+        authoritative_printable_mask=detection.masks.printable_back,
+        authoritative_outer_mask=detection.masks.outer,
+        authoritative_confidence=detection.confidence,
+        pose=detection.pose,
     )
     packed.masks = override_camera_exclusion(packed.masks, cam)
     packed.camera_bin = camera_bin
@@ -277,6 +322,10 @@ def _pack_detection(
     camera_contour: np.ndarray | None = None,
     camera_openings: list[np.ndarray] | None = None,
     camera_outer_rim: np.ndarray | None = None,
+    authoritative_printable_mask: np.ndarray | None = None,
+    authoritative_outer_mask: np.ndarray | None = None,
+    authoritative_confidence: float | None = None,
+    pose: Any = None,
 ) -> CoverDetection:
     masks = masks_from_binaries(
         outer_filled,
@@ -285,10 +334,16 @@ def _pack_detection(
         MASK_FEATHER_PX,
         camera_contour=camera_contour,
         cover_rgba=cover_rgba,
+        authoritative_printable_mask=authoritative_printable_mask,
+        authoritative_outer_mask=authoritative_outer_mask,
     )
-    confidence, warnings = _score(
-        cover_rgba, outer_filled, back_full, camera_found, has_alpha
-    )
+    if authoritative_confidence is not None:
+        confidence = float(authoritative_confidence)
+        warnings = []
+    else:
+        confidence, warnings = _score(
+            cover_rgba, outer_filled, back_full, camera_found, has_alpha
+        )
     warnings.extend(extra_warnings)
     raw = raw_outer if raw_outer is not None else outer_filled
 
@@ -316,10 +371,17 @@ def _pack_detection(
 
     debug = {
         "uploaded_cover": cover_rgba,
+        "debug_outer_rim": contour_overlay(cover_rgba, outer_filled, (255, 255, 0)),
+        "debug_inner_boundary": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
+        "debug_rim_band": rim_preview,
+        "debug_gap_overflow": rim_validation,
         "outer_cover_contour": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
+        "outer_rim_contour": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
+        "inner_rim_contour": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
         "detected_rim": rim_preview,
         "printable_boundary": contour_overlay(cover_rgba, back_full, (0, 255, 0)),
         "camera_mask": contour_overlay(cover_rgba, camera, (0, 255, 255)),
+        "final_printable_mask": mask_to_preview(masks.final_print),
         "final_artwork_mask": mask_to_preview(masks.final_print),
         "rim_validation": rim_validation,
         "outer_physical_rim": contour_overlay(cover_rgba, outer_filled, (0, 0, 255)),
@@ -374,6 +436,7 @@ def _pack_detection(
         raw_outer=raw,
         camera_contour=camera_contour,
         camera_openings=openings_list,
+        pose=pose,
     )
 
 
@@ -441,15 +504,6 @@ def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
         return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
     h, w = back_bin.shape[:2]
-    quad = _fit_perspective_phone_quad(_contour_points(back_bin))
-    if quad is not None:
-        qx0, qy0 = float(quad[:, 0].min()), float(quad[:, 1].min())
-        qx1, qy1 = float(quad[:, 0].max()), float(quad[:, 1].max())
-        qw, qh = qx1 - qx0, qy1 - qy0
-        if qx0 >= -0.15 * w and qy0 >= -0.15 * h and qx1 <= 1.15 * w and qy1 <= 1.15 * h:
-            if qw >= 0.40 * w and qh >= 0.40 * h:
-                return quad.astype(np.float32)
-
     x0, x1 = float(xs.min()), float(xs.max())
     y0, y1 = float(ys.min()), float(ys.max())
     aabb = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
@@ -463,19 +517,54 @@ def back_panel_quad(back_bin: np.ndarray) -> np.ndarray:
     (_cx, _cy), (_rw, _rh), angle = cv2.minAreaRect(contour)
     tilt = abs(angle) % 90.0
     tilt = min(tilt, 90.0 - tilt)
-    if tilt < 4.0:
+    if tilt < 3.0:
         return aabb
+
+    quad = _fit_perspective_phone_quad(_contour_points(back_bin))
+    if quad is not None:
+        quad_ordered = order_corners(quad)
+        tl, tr, br, bl = quad_ordered
+        if (
+            tl[0] <= x0 + 4.0 and tl[1] <= y0 + 4.0
+            and tr[0] >= x1 - 4.0 and tr[1] <= y0 + 4.0
+            and br[0] >= x1 - 4.0 and br[1] >= y1 - 4.0
+            and bl[0] <= x0 + 4.0 and bl[1] >= y1 - 4.0
+            and tl[0] >= -0.15 * w and tl[1] >= -0.15 * h
+            and br[0] <= 1.15 * w and br[1] <= 1.15 * h
+        ):
+            return quad_ordered
+
     pts = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float32)
     return order_corners(pts)
 
 
 def order_corners(pts: np.ndarray) -> np.ndarray:
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
-    ysort = pts[np.argsort(pts[:, 1])]
-    top_two = ysort[:2]
-    bot_two = ysort[2:]
-    tl, tr = top_two[np.argsort(top_two[:, 0])]
-    bl, br = bot_two[np.argsort(bot_two[:, 0])]
+    cx, cy = float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))
+    rect = cv2.minAreaRect(pts)
+    tilt = abs(rect[2]) % 90.0
+    tilt = min(tilt, 90.0 - tilt)
+    if tilt < 4.0:
+        ysort = pts[np.argsort(pts[:, 1])]
+        top_two = ysort[:2]
+        bot_two = ysort[2:]
+        tl, tr = top_two[np.argsort(top_two[:, 0])]
+        bl, br = bot_two[np.argsort(bot_two[:, 0])]
+        return np.array([tl, tr, br, bl], dtype=np.float32)
+
+    # For rotated quad:
+    angles = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+    pts_cw = pts[np.argsort(angles)]
+    top_idx = int(np.argmin(pts_cw[:, 1]))
+    p = np.roll(pts_cw, -top_idx, axis=0)
+
+    d01 = float(np.linalg.norm(p[1] - p[0]))
+    d12 = float(np.linalg.norm(p[2] - p[1]))
+    if d01 <= d12:
+        tl, tr, br, bl = p[0], p[1], p[2], p[3]
+    else:
+        tl, tr, br, bl = p[3], p[0], p[1], p[2]
+
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
@@ -489,10 +578,17 @@ def _outer_from_alpha(alpha: np.ndarray) -> np.ndarray:
 def _border_background_segmented_fg(rgb: np.ndarray) -> np.ndarray:
     """Background floodfill from image perimeter — robust for phone cases on light/dark backgrounds."""
     height, width = rgb.shape[:2]
-    border = np.concatenate([rgb[0, :], rgb[-1, :], rgb[:, 0], rgb[:, -1]], axis=0).astype(np.float32)
-    bg_med = np.median(border, axis=0)
-    dists = np.linalg.norm(border - bg_med, axis=1)
-    tol = max(14.0, float(np.percentile(dists, 90)) * 1.6 + 4.0)
+    c_w = max(4, int(0.04 * width))
+    c_h = max(4, int(0.04 * height))
+    corner_pixels = np.concatenate([
+        rgb[:c_h, :c_w].reshape(-1, 3),
+        rgb[:c_h, -c_w:].reshape(-1, 3),
+        rgb[-c_h:, :c_w].reshape(-1, 3),
+        rgb[-c_h:, -c_w:].reshape(-1, 3),
+    ], axis=0).astype(np.float32)
+    bg_med = np.median(corner_pixels, axis=0)
+    dists = np.linalg.norm(corner_pixels - bg_med, axis=1)
+    tol = float(np.clip(np.percentile(dists, 85) * 1.5 + 6.0, 12.0, 52.0))
 
     diff = np.linalg.norm(rgb.astype(np.float32) - bg_med, axis=2)
     cand = (diff < tol).astype(np.uint8) * 255
@@ -557,13 +653,24 @@ def _outer_from_rgb(rgb: np.ndarray) -> np.ndarray:
 
 
 def _cover_choice_score(mask: np.ndarray, height: int, width: int) -> float:
-    """Prefer the complete cover. Penalize jagged inner blobs and tiny slivers."""
+    """Prefer the complete cover. Penalize jagged inner blobs and canvas-filling rectangles."""
     ps = _phone_score(mask, height, width)
     if ps < 0.22:
         return -1.0
     area = float(mask.mean())
     rough = _contour_roughness(mask)
-    return float(ps + 0.50 * area - 0.22 * rough)
+    rb = _roundness_bonus(mask)
+    
+    if 0.20 <= area <= 0.76:
+        area_score = 0.35
+    elif 0.12 <= area <= 0.82:
+        area_score = 0.18
+    elif area > 0.85:
+        area_score = -0.60 if rb < 0.25 else -0.15
+    else:
+        area_score = 0.05
+        
+    return float(ps * 1.5 + area_score + 0.30 * rb - 0.30 * rough)
 
 
 def _contour_roughness(mask: np.ndarray) -> float:
@@ -584,13 +691,42 @@ def _contour_roughness(mask: np.ndarray) -> float:
     return float(np.clip((compact - 20.0) / 35.0, 0.0, 1.0))
 
 
+def _cap_bottom_port_drips(mask: np.ndarray) -> np.ndarray:
+    """Ensure bottom edge does not drip downward past the corner baseline (e.g. port cutouts leaking into table shadows)."""
+    if mask is None or not mask.any():
+        return mask
+    box = _bbox(mask)
+    if box is None:
+        return mask
+    bx, by, bw, bh = box
+    if bh < 40 or bw < 40:
+        return mask
+    bot_y = by + bh
+    left_strip = mask[by + int(0.85 * bh) : bot_y, bx : bx + int(0.20 * bw)]
+    right_strip = mask[by + int(0.85 * bh) : bot_y, bx + int(0.80 * bw) : bx + bw]
+    if not left_strip.any() or not right_strip.any():
+        return mask
+
+    ys_l, _ = np.where(left_strip)
+    ys_r, _ = np.where(right_strip)
+    corner_baseline_y = by + int(0.85 * bh) + max(int(ys_l.max()), int(ys_r.max()))
+
+    margin = max(6, int(0.025 * bw))
+    if bot_y > corner_baseline_y + margin:
+        clipped = mask.copy()
+        clipped[corner_baseline_y + 2 :, bx + int(0.28 * bw) : bx + int(0.72 * bw)] = False
+        return _fill_holes(_largest_component(clipped))
+    return mask
+
+
 def _polish_cover_contour(mask: np.ndarray) -> np.ndarray:
     """Kill 1px teeth on the real silhouette. Never replace it with a hull or polygon."""
     from app.core.mask_generator import smooth_silhouette
 
     if mask is None or not mask.any():
         return mask
-    filled = _fill_holes(_largest_component(mask.astype(bool)))
+    capped = _cap_bottom_port_drips(mask)
+    filled = _fill_holes(_largest_component(capped.astype(bool)))
     h, w = filled.shape
     k = max(5, int(round(0.0055 * min(h, w))))
     if k % 2 == 0:
@@ -1040,12 +1176,13 @@ def _grabcut_border_fg(rgb: np.ndarray) -> np.ndarray:
         small = rgb
     sh, sw = small.shape[:2]
     mask = np.full((sh, sw), cv2.GC_PR_BGD, dtype=np.uint8)
-    mask[0, :] = cv2.GC_BGD
-    mask[-1, :] = cv2.GC_BGD
-    mask[:, 0] = cv2.GC_BGD
-    mask[:, -1] = cv2.GC_BGD
-    y0, y1 = int(0.12 * sh), int(0.88 * sh)
-    x0, x1 = int(0.15 * sw), int(0.85 * sw)
+    pad = max(2, int(0.015 * min(sh, sw)))
+    mask[:pad, :] = cv2.GC_BGD
+    mask[-pad:, :] = cv2.GC_BGD
+    mask[:, :pad] = cv2.GC_BGD
+    mask[:, -pad:] = cv2.GC_BGD
+    y0, y1 = int(0.03 * sh), int(0.97 * sh)
+    x0, x1 = int(0.04 * sw), int(0.96 * sw)
     mask[y0:y1, x0:x1] = cv2.GC_PR_FGD
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
@@ -1169,13 +1306,292 @@ def _inner_from_distinct_rim(
     return None
 
 
+def _repair_lateral_panel_notches(
+    panel: np.ndarray, outer: np.ndarray, min_side: float
+) -> np.ndarray:
+    """Repair artificial side notches (e.g. card holder thumb cutouts, reflection bites).
+
+    A phone printable back panel is convex along its left and right vertical edges.
+    If a nested edge detection caught a thumb notch or reflection indent along the vertical sides,
+    convexity defects along the left/right profile are bridged back to outer.
+    """
+    if panel is None or not panel.any() or not outer.any():
+        return panel
+    u8 = (panel.astype(np.uint8)) * 255
+    contours, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return panel
+    contour = max(contours, key=cv2.contourArea)
+    if len(contour) < 16:
+        return panel
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 4:
+        return panel
+    try:
+        hull = np.sort(hull, axis=0)
+        defects = cv2.convexityDefects(contour, hull)
+    except Exception:
+        return panel
+    if defects is None:
+        return panel
+
+    ys, xs = np.where(outer)
+    if ys.size == 0:
+        return panel
+    y_min, y_max = float(ys.min()), float(ys.max())
+    x_min, x_max = float(xs.min()), float(xs.max())
+    ph_h = max(1.0, y_max - y_min)
+    ph_w = max(1.0, x_max - x_min)
+
+    out = u8.copy()
+    repaired_any = False
+    for row in defects:
+        start_i, end_i, far_i, depth_raw = (int(v) for v in row[0])
+        depth = float(depth_raw) / 256.0
+        pt_start = contour[start_i][0]
+        pt_end = contour[end_i][0]
+        pt_far = contour[far_i][0]
+
+        # Check if defect is along the vertical sides (flanks) of the phone:
+        # Mid-height zone: between 12% and 88% of phone height (excluding top/bottom corner curves)
+        in_side_y_zone = (y_min + 0.12 * ph_h <= pt_far[1] <= y_max - 0.12 * ph_h)
+        # Outer flank zone: sitting in the outer 45% of width
+        is_left_or_right = (pt_far[0] <= x_min + 0.45 * ph_w) or (pt_far[0] >= x_max - 0.45 * ph_w)
+
+        if in_side_y_zone and is_left_or_right and depth >= max(3.5, 0.012 * min_side):
+            tri = np.array([pt_start, pt_end, pt_far], dtype=np.int32)
+            cv2.fillConvexPoly(out, tri, 255)
+            if start_i < end_i:
+                seg = contour[start_i : end_i + 1]
+            else:
+                seg = np.vstack([contour[start_i:], contour[: end_i + 1]])
+            cv2.fillPoly(out, [seg], 255)
+            repaired_any = True
+
+    if not repaired_any:
+        return panel
+
+    repaired = (out > 0) & outer
+    return _fill_holes(repaired)
+
+
+def _valid_panel_span(panel: np.ndarray, outer: np.ndarray) -> bool:
+    """Ensure candidate panel covers the full phone span from top to bottom and left to right."""
+    if panel is None or not panel.any() or not outer.any():
+        return False
+    ys_in, xs_in = np.where(panel)
+    ys_out, xs_out = np.where(outer)
+    if ys_in.size == 0 or ys_out.size == 0:
+        return False
+    outer_h = float(max(ys_out.max() - ys_out.min(), 1))
+    outer_w = float(max(xs_out.max() - xs_out.min(), 1))
+    top_margin = float(ys_in.min() - ys_out.min()) / outer_h
+    bot_margin = float(ys_out.max() - ys_in.max()) / outer_h
+    left_margin = float(xs_in.min() - xs_out.min()) / outer_w
+    right_margin = float(xs_out.max() - xs_in.max()) / outer_w
+    # Physical rims are narrow borders (typically 0.5% - 5%, max 8.5%).
+    # Any candidate that leaves > 8.5% at top or bottom is an internal reflection / cutout!
+    if top_margin > 0.085 or bot_margin > 0.085:
+        return False
+    if left_margin > 0.095 or right_margin > 0.095:
+        return False
+    return True
+
+
+def _trace_physical_inner_rim(
+    rgb: np.ndarray,
+    outer: np.ndarray,
+    min_side: float,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, float]:
+    """Detect the actual physical inner rim contour and printable panel via multi-signal DP profiling.
+
+    Fallback path for when the authoritative geometry pipeline in cover_geometry.py
+    is not available. Uses multi-scale gradient + color variance + adaptive geometric prior
+    with minimum rim thickness enforcement.
+
+    Returns
+    -------
+    tuple[panel_mask, poly_outer, poly_inner, confidence]
+    """
+    if rgb is None or outer is None or not np.any(outer):
+        return None, None, None, 0.0
+
+    h, w = rgb.shape[:2]
+    contours, _ = cv2.findContours(outer.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None, None, None, 0.0
+    c = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+    if len(c) < 32:
+        return None, None, None, 0.0
+
+    N = 512
+    diff = np.diff(c, axis=0, append=c[:1])
+    dists = np.hypot(diff[:, 0], diff[:, 1])
+    cum = np.cumsum(dists)
+    total = float(cum[-1])
+    if total < 50.0:
+        return None, None, None, 0.0
+    cum = np.insert(cum, 0, 0.0)
+    targets = np.linspace(0.0, total, N, endpoint=False)
+    c_closed = np.vstack([c, c[:1]])
+    rx = np.interp(targets, cum, c_closed[:, 0])
+    ry = np.interp(targets, cum, c_closed[:, 1])
+    poly = np.column_stack([rx, ry])
+
+    # Inward normals
+    prev = np.roll(poly, 1, axis=0)
+    nxt = np.roll(poly, -1, axis=0)
+    tangent = nxt - prev
+    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-6)
+    centroid = poly.mean(axis=0)
+    if float(np.dot(poly[0] + normal[0] - centroid, poly[0] - centroid)) > 0:
+        normal = -normal
+
+    # Multi-scale gradient
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blur3 = cv2.bilateralFilter(gray, 5, 45, 45)
+    blur5 = cv2.bilateralFilter(gray, 9, 55, 55)
+
+    gx3 = cv2.Sobel(blur3, cv2.CV_32F, 1, 0, ksize=3)
+    gy3 = cv2.Sobel(blur3, cv2.CV_32F, 0, 1, ksize=3)
+    grad3 = np.hypot(gx3, gy3)
+
+    gx5 = cv2.Sobel(blur5, cv2.CV_32F, 1, 0, ksize=5)
+    gy5 = cv2.Sobel(blur5, cv2.CV_32F, 0, 1, ksize=5)
+    grad5 = np.hypot(gx5, gy5)
+    scale5 = max(float(np.percentile(grad3[outer], 95)), 1.0) / max(float(np.percentile(grad5[outer], 95)), 1.0) if np.any(outer) else 1.0
+    grad = np.maximum(grad3, grad5 * scale5)
+
+    # Search bounds and minimum rim floor
+    d_min = max(2.0, 0.004 * min_side)
+    d_max = max(14.0, 0.080 * min_side)
+    K = 48
+    d_vals = np.linspace(d_min, d_max, K).astype(np.float32)
+    rim_floor = max(3.0, 0.012 * min_side)
+
+    sample_x = np.clip(poly[:, 0:1] + normal[:, 0:1] * d_vals[None, :], 0, w - 1).astype(np.float32)
+    sample_y = np.clip(poly[:, 1:2] + normal[:, 1:2] * d_vals[None, :], 0, h - 1).astype(np.float32)
+
+    # Signal 1: Gradient with blended normalization
+    g_samples = cv2.remap(grad, sample_x, sample_y, cv2.INTER_LINEAR)
+    ray_max = np.maximum(g_samples.max(axis=1, keepdims=True), 1e-3)
+    global_p80 = max(float(np.percentile(grad[outer], 80) if np.any(outer) else 25.0), 8.0)
+    norm_scale = np.maximum(0.5 * ray_max + 0.5 * global_p80, 1.0)
+    g_norm = np.clip(g_samples / norm_scale, 0.0, 1.5)
+
+    mean_gradient_evidence = float(np.mean(np.max(g_norm, axis=1)))
+
+    # Signal 2: Color variance along rays
+    rgb_f = rgb.astype(np.float32)
+    r_s = cv2.remap(rgb_f[..., 0], sample_x, sample_y, cv2.INTER_LINEAR)
+    g_s = cv2.remap(rgb_f[..., 1], sample_x, sample_y, cv2.INTER_LINEAR)
+    b_s = cv2.remap(rgb_f[..., 2], sample_x, sample_y, cv2.INTER_LINEAR)
+    dr = np.diff(r_s, axis=1, prepend=r_s[:, :1])
+    dg = np.diff(g_s, axis=1, prepend=g_s[:, :1])
+    db = np.diff(b_s, axis=1, prepend=b_s[:, :1])
+    color_delta = np.sqrt(dr**2 + dg**2 + db**2)
+    color_delta_norm = np.clip(color_delta / max(float(np.percentile(color_delta, 90)), 1.0), 0.0, 1.5)
+
+    # Adaptive geometric prior
+    prior_center = float(np.clip(0.025 * min_side, 4.5, 22.0))
+    prior_sigma = float(max(0.018 * min_side, 3.5))
+    if mean_gradient_evidence < 0.25:
+        prior_weight = 0.65
+    elif mean_gradient_evidence < 0.45:
+        prior_weight = 0.45
+    else:
+        prior_weight = 0.20
+
+    width_prior = -prior_weight * np.exp(-0.5 * ((d_vals[None, :] - prior_center) / prior_sigma)**2)
+
+    # Minimum rim thickness penalty
+    thin_penalty = np.zeros((1, K), dtype=np.float32)
+    for k_idx in range(K):
+        if d_vals[k_idx] < rim_floor:
+            deficit = (rim_floor - d_vals[k_idx]) / max(rim_floor, 1.0)
+            thin_penalty[0, k_idx] = 1.5 * deficit ** 2
+    thin_penalty = np.broadcast_to(thin_penalty, (N, K))
+
+    cost_matrix = -g_norm - 0.25 * color_delta_norm + width_prior + thin_penalty
+
+    # DP with adaptive smoothing
+    unroll_N = N + 64
+    unroll_costs = np.vstack([cost_matrix, cost_matrix[:64]])
+
+    if mean_gradient_evidence < 0.3:
+        smooth_lambda = 1.8
+    elif mean_gradient_evidence < 0.5:
+        smooth_lambda = 1.4
+    else:
+        smooth_lambda = 1.0
+
+    dp = np.zeros((unroll_N, K), dtype=np.float32)
+    backptr = np.zeros((unroll_N, K), dtype=np.int32)
+    dp[0] = unroll_costs[0]
+
+    diff_d = d_vals[None, :] - d_vals[:, None]
+    trans_cost = smooth_lambda * (diff_d**2)
+
+    for i in range(1, unroll_N):
+        all_trans = dp[i-1, :, None] + trans_cost
+        best_prev = np.argmin(all_trans, axis=0)
+        dp[i] = all_trans[best_prev, np.arange(K)] + unroll_costs[i]
+        backptr[i] = best_prev
+
+    best_end = np.argmin(dp[-1])
+    path = [best_end]
+    for i in range(unroll_N - 1, 0, -1):
+        path.append(backptr[i, path[-1]])
+    path.reverse()
+
+    opt_indices = path[64:64+N]
+    opt_dists = d_vals[opt_indices].astype(np.float64)
+
+    # Enforce minimum rim thickness
+    opt_dists = np.maximum(opt_dists, rim_floor)
+
+    # Post-DP validation
+    median_rim = float(np.median(opt_dists))
+    if median_rim / min_side < 0.008:
+        fallback_width = max(rim_floor, 0.025 * min_side)
+        opt_dists = np.full_like(opt_dists, fallback_width)
+
+    # Circular Gaussian smoothing
+    padded_d = np.concatenate([opt_dists[-20:], opt_dists, opt_dists[:20]])
+    smooth_padded = cv2.GaussianBlur(padded_d.reshape(-1, 1).astype(np.float32), (15, 1), 2.5).ravel()
+    d_smooth = smooth_padded[20:20+N]
+    d_smooth = np.maximum(d_smooth, rim_floor * 0.85)
+
+    inner_pts = poly + normal * d_smooth[:, None]
+
+    inner_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(inner_mask, [np.round(inner_pts).astype(np.int32)], 1)
+    panel = (inner_mask > 0) & outer
+
+    # Cross-validate area ratio
+    outer_area = float(np.count_nonzero(outer))
+    frac = float(np.count_nonzero(panel)) / max(outer_area, 1.0)
+    if frac < 0.60 or frac > 0.985:
+        safe_width = max(rim_floor, 0.020 * min_side)
+        d_smooth = np.full(N, safe_width, dtype=np.float64)
+        inner_pts = poly + normal * d_smooth[:, None]
+        inner_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(inner_mask, [np.round(inner_pts).astype(np.int32)], 1)
+        panel = (inner_mask > 0) & outer
+
+    mean_grad = float(np.mean(cv2.remap(grad, inner_pts[:, 0].astype(np.float32).reshape(1, -1), inner_pts[:, 1].astype(np.float32).reshape(1, -1), cv2.INTER_LINEAR)))
+    conf = float(np.clip(0.45 + 0.50 * min(1.0, mean_grad / 25.0), 0.0, 1.0))
+    return panel, poly, inner_pts, conf
+
+
 def _inner_printable_panel(
     cover_rgba: np.ndarray,
     outer: np.ndarray,
     has_alpha: bool,
     min_side: float,
 ) -> np.ndarray:
-    """Inner printable lip from this cover's geometry (distinct rim, nested contour, or measured inset)."""
+    """Inner printable lip from this cover's geometry (physical rim DP trace, distinct rim, or nested contour)."""
     rgb = cover_rgba[..., :3]
     outer_area = max(float(np.count_nonzero(outer)), 1.0)
     ys_out, _ = np.where(outer)
@@ -1184,13 +1600,22 @@ def _inner_printable_panel(
 
     dist_outer = cv2.distanceTransform(outer.astype(np.uint8), cv2.DIST_L2, 5)
 
+    # Priority 0: Physical Inner Rim Contour via normal-ray DP profiling
+    phys_panel, poly_outer, poly_inner, rim_conf = _trace_physical_inner_rim(rgb, outer, min_side)
+    if phys_panel is not None and np.any(phys_panel):
+        frac = float(np.count_nonzero(phys_panel)) / outer_area
+        if 0.70 <= frac <= 0.985 and _valid_panel_span(phys_panel, outer):
+            return phys_panel
+
     # Priority 1: High-contrast or colored distinct physical rim (opaque cases with physical bumper/rim)
     if not has_alpha:
         distinct_rim_panel = _inner_from_distinct_rim(cover_rgba, outer, min_side)
         if distinct_rim_panel is not None and np.any(distinct_rim_panel):
+            distinct_rim_panel = _repair_lateral_panel_notches(distinct_rim_panel, outer, min_side)
             frac = float(np.count_nonzero(distinct_rim_panel)) / outer_area
             if 0.55 <= frac <= 0.985 and _phone_score(distinct_rim_panel, outer.shape[0], outer.shape[1]) >= 0.20:
-                return distinct_rim_panel
+                if _valid_panel_span(distinct_rim_panel, outer):
+                    return distinct_rim_panel
 
     # Priority 2: Nested visible lips & edge loops
     bumper = _side_wall_width(cover_rgba, outer, has_alpha, min_side)
@@ -1201,8 +1626,11 @@ def _inner_printable_panel(
         if candidate is None or not np.any(candidate):
             continue
         panel = _fill_holes(candidate.astype(bool) & outer)
+        panel = _repair_lateral_panel_notches(panel, outer, min_side)
         frac = float(np.count_nonzero(panel)) / outer_area
         if 0.55 <= frac <= 0.985 and _phone_score(panel, outer.shape[0], outer.shape[1]) >= 0.22:
+            if not _valid_panel_span(panel, outer):
+                continue
             ys_in, _ = np.where(panel)
             if ys_in.size:
                 top_gap = ys_in.min() - outer_top
@@ -1260,6 +1688,8 @@ def _inner_from_nested_edges(rgb: np.ndarray, outer: np.ndarray, min_side: float
         filled = np.zeros(outer.shape, dtype=np.uint8)
         cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
         panel = filled.astype(bool) & outer
+        if not _valid_panel_span(panel, outer):
+            continue
         frac = float(np.count_nonzero(panel)) / max(outer_area, 1.0)
         if frac < 0.55 or frac > 0.985:
             continue
@@ -1287,8 +1717,9 @@ def _fill_shallow_notches(mask: np.ndarray, min_side: float) -> np.ndarray:
     if hull is None or len(hull) < 4:
         return mask.astype(bool)
     try:
+        hull = np.sort(hull, axis=0)
         defects = cv2.convexityDefects(contour, hull)
-    except cv2.error:
+    except Exception:
         return mask.astype(bool)
     if defects is None:
         return mask.astype(bool)
@@ -1340,6 +1771,8 @@ def _inner_from_visible_lip(rgb: np.ndarray, outer: np.ndarray, min_side: float)
         filled = np.zeros(outer.shape, dtype=np.uint8)
         cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
         fb = filled.astype(bool) & outer
+        if not _valid_panel_span(fb, outer):
+            continue
         if float(np.count_nonzero(fb)) < 0.55 * outer_area:
             continue
         # Boundary should sit in the bumper band, not on the outer rim or the center.

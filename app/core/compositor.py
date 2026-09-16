@@ -7,6 +7,7 @@ unchanged. Cover pixels are kept only where the print mask is zero
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from app.core.camera_rim_shading import apply_3d_camera_rim_shading
@@ -58,6 +59,15 @@ def composite_design_under_cover(
     if overlay > 0.0:
         mix = overlay * mask
         design_rgb = design_rgb * (1.0 - mix[..., None]) + cover_rgb * mix[..., None]
+
+    # Physical inner rim contact shadow (ambient occlusion):
+    # Raised bumper lip casts an inward drop shadow along the recessed print perimeter.
+    mask_bin = (mask >= 0.5).astype(np.uint8)
+    if mask_bin.any():
+        dist_in = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5)
+        ao_falloff = np.clip(dist_in / 4.5, 0.0, 1.0)
+        ao_shadow = 0.82 + 0.18 * (ao_falloff ** 0.8)
+        design_rgb = design_rgb * ao_shadow[..., None]
 
     art_w = np.clip(mask * design_a, 0.0, 1.0)
     keep = 1.0 - art_w

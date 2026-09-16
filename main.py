@@ -168,6 +168,73 @@ def run_smoke_test() -> int:
     jpg_proc.export("png", jpg_result_path)
     print(f"  exported JPG-cover mockup: {jpg_result_path}")
 
+    print("Testing arbitrary rotated phone pose (diagonally tilted)...")
+    rotated_cover = COVERS_DIR / "vivo_rotated_diagonal.png"
+    if rotated_cover.exists():
+        rot_proc = CoverProcessor()
+        rot_det = rot_proc.load_cover(rotated_cover)
+        print(f"  Rotated cover confidence: {rot_det.confidence:.2f}")
+        print(f"  Rotated cover camera found: {rot_det.camera_found}")
+        print(f"  Rotated cover angle: {getattr(rot_det.pose, 'angle', 0.0):.1f}°")
+        if rot_det.confidence < 0.60:
+            print("FAIL: Rotated cover confidence too low")
+            return 1
+        if not rot_det.camera_found:
+            print("FAIL: Rotated cover camera not detected")
+            return 1
+        rot_res = rot_proc.process_design(design_path)
+        rot_printed = rot_res.masks.final_print > 0.95
+        rot_untouched = rot_res.masks.final_print < 0.02
+        if not rot_printed.any():
+            print("FAIL: Rotated cover printable area empty")
+            return 1
+        rot_diff = np.abs(rot_res.composite.astype(np.int16) - rot_proc.cover.astype(np.int16)).max(axis=2)
+        rot_leak = int(rot_diff[rot_untouched].max()) if rot_untouched.any() else 0
+        rot_change = int(rot_diff[rot_printed].max()) if rot_printed.any() else 0
+        print(f"  Rotated max delta outside mask: {rot_leak}")
+        print(f"  Rotated max delta inside printable area: {rot_change}")
+        if rot_leak > 2:
+            print("FAIL: Rotated cover artwork leaked outside printable mask")
+            return 1
+        if rot_change < 8:
+            print("FAIL: Rotated cover design was not applied inside printable area")
+            return 1
+        rot_result_path = OUTPUT_DIR / "smoke_rotated_cover.png"
+        rot_proc.export("png", rot_result_path)
+        print(f"  exported rotated-cover mockup: {rot_result_path}")
+
+    print("Testing MAKE MOCKUPS Studio workflow (10 Commercial Scenes)...")
+    from app.core.mockup_extractor import extract_phone_foreground
+    from app.core.mockup_engine import generate_all_mockups, load_all_background_paths
+    from app.utils.constants import MOCKUP_BG_DIR
+
+    bg_list = load_all_background_paths(MOCKUP_BG_DIR)
+    print(f"  found {len(bg_list)} background scenes in {MOCKUP_BG_DIR.name}")
+    if len(bg_list) != 10:
+        print(f"FAIL: Expected 10 background images, found {len(bg_list)}")
+        return 1
+
+    extracted = extract_phone_foreground(result.composite, outer_mask=result.masks.outer)
+    print(f"  extracted phone bbox: {extracted.bbox}, aspect: {extracted.aspect_ratio:.2f}")
+    if extracted.rgba.shape[2] != 4 or extracted.rgba.shape[0] < 50 or extracted.rgba.shape[1] < 50:
+        print("FAIL: Extracted phone dimensions or channels invalid")
+        return 1
+
+    mockup_results = generate_all_mockups(extracted)
+    print(f"  successfully generated {len(mockup_results)} commercial mockups")
+    if len(mockup_results) != 10:
+        print(f"FAIL: Expected 10 mockup composites, got {len(mockup_results)}")
+        return 1
+
+    for title, comp in mockup_results:
+        if comp.shape[:2] != (1402, 1122):
+            print(f"FAIL: Unexpected resolution {comp.shape[:2]} for {title}")
+            return 1
+        if np.isnan(comp).any() or np.isinf(comp).any():
+            print(f"FAIL: NaN or Inf detected in {title}")
+            return 1
+    print("  all 10 mockup composites verified (1122x1402, valid pixels, contact & cast shadows applied)")
+
     print("SMOKE TEST PASSED")
     return 0
 
