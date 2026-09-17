@@ -2,9 +2,13 @@
 .venv/
 venv/
 env/
+ENV/
 *.egg-info/
+dist/
+build/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -18,7 +22,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .cursor/
+.vscode/
+.idea/
 *.swp
+*.swo
+*~
 
 # Debug / local dumps
 *.log
@@ -35,3 +43,4 @@ assets/examples/*
 !assets/examples/.gitkeep
 assets/icons/*
 !assets/icons/.gitkeep
+
